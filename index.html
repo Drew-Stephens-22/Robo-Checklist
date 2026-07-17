@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Robotic Arm Tracker</title>
+  
+  <!-- 1. Load React and ReactDOM from CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  
+  <!-- 2. Load Babel to translate JSX in the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <style>
+    body { margin: 0; padding: 0; }
+  </style>
+</head>
+<body>
+  <!-- This is where your app will render -->
+  <div id="root"></div>
+
+  <!-- 3. Your JSX Code -->
+  <script type="text/babel">
+    // Extract React hooks from the global React object
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    /* ------------------------------------------------------------------ */
+    /*  Robotic Arm Build Tracker — blueprint-style project companion      */
+    /*  MakerWorld model 1134925 · Robotic Arm with Servo & Arduino        */
+    /* ------------------------------------------------------------------ */
+
+    const FONT_CSS = `
+    @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+    `;
+
+    const T = {
+      bg: "#0C1826",
+      panel: "#122238",
+      panelHi: "#18304C",
+      line: "#23405F",
+      ink: "#DCEBFA",
+      dim: "#7FA0C0",
+      cyan: "#5CC8FF",
+      green: "#63E6A8",
+      amber: "#FFB454",
+      red: "#FF7B7B",
+    };
+
+    const uid = () => Math.random().toString(36).slice(2, 10);
+
+    const STL_NAMES = [
+      "Alt_Govde.stl", "Alt_Kapak.stl", "Alt_Kasa.stl", "Alt_Kol.stl",
+      "Bilek.stl", "Disli.stl", "El.stl", "El_Ust.stl",
+      "Jack_Cover.stl", "Mil_1.stl", "Mil_2.stl", "Mil_3.stl",
+      "Mil_Disli.stl", "On_Kol.stl", "Parmak X 2.stl", "Parmak_2 X 2.stl",
+      "Parmak_Disli X 2.stl", "Servo_Cable_Holder.stl", "Servo_Disli.stl", "Tabla_Alt.stl"
+    ];
+
+    const DEFAULT_STL = STL_NAMES.map((name, i) => ({
+      id: `stl${i + 1}`,
+      name,
+      done: false,
+    }));
+
+    const DEFAULT_ELEC = [
+      { id: "e1", name: "1 × Arduino Uno or Arduino Mega", done: false },
+      { id: "e2", name: "1 × Mini Breadboard", done: false },
+      { id: "e3", name: "4 × MG995 or MG996R Servo (180°)", done: false },
+      { id: "e4", name: "3 × MG90S Servo (180°)", done: false },
+      { id: "e5", name: "1 × KCD1 Rocker Switch", done: false },
+      { id: "e6", name: "1 × 608 Bearing", done: false },
+      { id: "e7", name: "2 × 6203 Bearing", done: false },
+      { id: "e8", name: "1 × 5V 10A Power Supply", done: false },
+      { id: "e9", name: "Various M3 Bolts (M3×6 / M3×10 / M3×14)", done: false },
+      { id: "e10", name: "Jumper Cables", done: false },
+    ];
+
+    const PARTS_KEY = "robotarm:parts";
+    const CODE_KEY = "robotarm:code";
+    const NOTES_KEY = "robotarm:notes";
+    const IMG_PREFIX = "robotarm:img:";
+
+    /* ---------------------------- storage ----------------------------- */
+
+    async function sGet(key) {
+      try {
+        const r = localStorage.getItem(key);
+        return r ? JSON.parse(r) : null;
+      } catch {
+        return null;
+      }
+    }
+    async function sSet(key, val) {
+      try {
+        localStorage.setItem(key, JSON.stringify(val));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    async function sDel(key) {
+      try {
+        localStorage.removeItem(key);
+      } catch {}
+    }
+
+    /* --------------------------- UI atoms ----------------------------- */
+
+    const styles = {
+      app: {
+        minHeight: "100vh",
+        background: T.bg,
+        backgroundImage: `linear-gradient(${T.line}22 1px, transparent 1px),
+          linear-gradient(90deg, ${T.line}22 1px, transparent 1px)`,
+        backgroundSize: "28px 28px",
+        color: T.ink,
+        fontFamily: "'Chakra Petch', sans-serif",
+        paddingBottom: 60,
+      },
+      mono: { fontFamily: "'IBM Plex Mono', monospace" },
+      panel: {
+        background: T.panel,
+        border: `1px solid ${T.line}`,
+        borderRadius: 10,
+        padding: 18,
+      },
+      input: {
+        background: T.bg,
+        border: `1px solid ${T.line}`,
+        borderRadius: 6,
+        color: T.ink,
+        padding: "9px 11px",
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: 13,
+        outline: "none",
+        width: "100%",
+        boxSizing: "border-box",
+      },
+      btn: {
+        background: T.cyan,
+        color: "#06263C",
+        border: "none",
+        borderRadius: 6,
+        padding: "9px 16px",
+        fontFamily: "'Chakra Petch', sans-serif",
+        fontWeight: 600,
+        fontSize: 13,
+        cursor: "pointer",
+        letterSpacing: "0.04em",
+      },
+      ghostBtn: {
+        background: "transparent",
+        color: T.dim,
+        border: `1px solid ${T.line}`,
+        borderRadius: 6,
+        padding: "8px 14px",
+        fontFamily: "'Chakra Petch', sans-serif",
+        fontWeight: 500,
+        fontSize: 13,
+        cursor: "pointer",
+      },
+    };
+
+    function Eyebrow({ children, color = T.cyan }) {
+      return (
+        <div style={{ ...styles.mono, fontSize: 11, letterSpacing: "0.22em", textTransform: "uppercase", color, marginBottom: 6 }}>
+          {children}
+        </div>
+      );
+    }
+
+    function ProgressBar({ value, total, color }) {
+      const pct = total ? Math.round((value / total) * 100) : 0;
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ flex: 1, height: 8, background: T.bg, border: `1px solid ${T.line}`, borderRadius: 99, overflow: "hidden" }}>
+            <div style={{ width: `${pct}%`, height: "100%", background: color, transition: "width .35s ease" }} />
+          </div>
+          <span style={{ ...styles.mono, fontSize: 12, color: T.dim, minWidth: 74, textAlign: "right" }}>
+            {value}/{total} · {pct}%
+          </span>
+        </div>
+      );
+    }
+
+    /* ------------------------- checklist row -------------------------- */
+
+    function ChecklistRow({ item, onToggle, onRename, onDelete }) {
+      const [editing, setEditing] = useState(false);
+      const [draft, setDraft] = useState(item.name);
+
+      const commit = () => {
+        const v = draft.trim();
+        if (v) onRename(v);
+        else setDraft(item.name);
+        setEditing(false);
+      };
+
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderBottom: `1px solid ${T.line}55`, background: item.done ? `${T.green}0D` : "transparent", borderRadius: 6 }}>
+          <button onClick={onToggle} style={{ width: 22, height: 22, minWidth: 22, borderRadius: 5, border: `2px solid ${item.done ? T.green : T.line}`, background: item.done ? T.green : "transparent", color: "#06263C", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, padding: 0 }}>
+            {item.done ? "✓" : ""}
+          </button>
+          {editing ? (
+            <input autoFocus style={{ ...styles.input, padding: "6px 8px" }} value={draft} onChange={(e) => setDraft(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && commit()} />
+          ) : (
+            <span onClick={() => { setDraft(item.name); setEditing(true); }} style={{ flex: 1, fontSize: 14, cursor: "text", color: item.done ? T.dim : T.ink, textDecoration: item.done ? "line-through" : "none" }}>
+              {item.name}
+            </span>
+          )}
+          <button onClick={onDelete} style={{ background: "transparent", border: "none", color: T.dim, cursor: "pointer", fontSize: 15, padding: "2px 6px" }}>✕</button>
+        </div>
+      );
+    }
+
+    /* -------------------------- page: parts --------------------------- */
+
+    function PartsPage({ parts, setParts, save }) {
+      const [newName, setNewName] = useState("");
+      const [newSection, setNewSection] = useState("elec");
+
+      const mutate = (fn) => {
+        setParts((p) => {
+          const next = fn(structuredClone(p));
+          save(next);
+          return next;
+        });
+      };
+
+      const addPart = () => {
+        const v = newName.trim();
+        if (!v) return;
+        mutate((p) => { p[newSection].push({ id: uid(), name: v, done: false }); return p; });
+        setNewName("");
+      };
+
+      const section = (key, title, hint, color) => {
+        const list = parts[key];
+        const done = list.filter((i) => i.done).length;
+        return (
+          <div style={{ ...styles.panel, marginBottom: 18 }}>
+            <div><Eyebrow color={color}>{title}</Eyebrow><div style={{ ...styles.mono, fontSize: 12, color: T.dim, marginBottom: 10 }}>{hint}</div></div>
+            <div style={{ marginBottom: 12 }}><ProgressBar value={done} total={list.length} color={color} /></div>
+            {list.map((item) => (
+              <ChecklistRow key={item.id} item={item} onToggle={() => mutate((p) => { p[key].find((x) => x.id === item.id).done = !p[key].find((x) => x.id === item.id).done; return p; })} onRename={(name) => mutate((p) => { p[key].find((x) => x.id === item.id).name = name; return p; })} onDelete={() => mutate((p) => { p[key] = p[key].filter((x) => x.id !== item.id); return p; })} />
+            ))}
+          </div>
+        );
+      };
+
+      return (
+        <div>
+          <div style={{ ...styles.panel, marginBottom: 18, background: T.panelHi }}>
+            <Eyebrow>Overall build readiness</Eyebrow>
+            <ProgressBar value={parts.stl.filter(i=>i.done).length + parts.elec.filter(i=>i.done).length} total={parts.stl.length + parts.elec.length} color={T.cyan} />
+          </div>
+          {section("stl", "Printed parts — 20 STL files", "Click a name to rename.", T.amber)}
+          {section("elec", "Electronics & hardware", "Bill of materials.", T.green)}
+          <div style={styles.panel}>
+            <Eyebrow>Add a missing part</Eyebrow>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 6 }}>
+              <input style={{ ...styles.input, flex: "1 1 220px" }} value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addPart()} />
+              <select value={newSection} onChange={(e) => setNewSection(e.target.value)} style={{ ...styles.input, width: "auto", flex: "0 0 auto" }}>
+                <option value="elec">Electronics & hardware</option>
+                <option value="stl">Printed parts</option>
+              </select>
+              <button style={styles.btn} onClick={addPart}>Add part</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* -------------------------- page: video --------------------------- */
+
+    function VideoPage() {
+      return (
+        <div style={{ ...styles.panel, marginBottom: 18 }}>
+          <Eyebrow>Assembly video</Eyebrow>
+          <div style={{ position: "relative", paddingTop: "56.25%", borderRadius: 8, overflow: "hidden", border: `1px solid ${T.line}`, marginTop: 10 }}>
+            <iframe src="https://www.youtube.com/embed/CHV36hu9z3E" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: "none" }} allowFullScreen />
+          </div>
+        </div>
+      );
+    }
+
+    /* --------------------------- page: code --------------------------- */
+
+    function CodePage({ snippets, setSnippets, save }) {
+      const [title, setTitle] = useState("");
+      const [body, setBody] = useState("");
+
+      const submit = () => {
+        if (!body.trim()) return;
+        const s = [{ id: uid(), title: title.trim() || "Untitled sketch", body, ts: Date.now() }, ...snippets];
+        setSnippets(s); save(s); setTitle(""); setBody("");
+      };
+
+      return (
+        <div>
+          <div style={{ ...styles.panel, marginBottom: 18 }}>
+            <Eyebrow>Save a sketch</Eyebrow>
+            <input style={{ ...styles.input, marginBottom: 10 }} value={title} onChange={(e) => setTitle(e.target.value)} />
+            <textarea style={{ ...styles.input, minHeight: 180, resize: "vertical" }} value={body} onChange={(e) => setBody(e.target.value)} spellCheck={false} />
+            <button style={{...styles.btn, marginTop: 10}} onClick={submit}>Save sketch</button>
+          </div>
+          {snippets.map((sn) => (
+            <div key={sn.id} style={{ ...styles.panel, marginBottom: 14 }}>
+              <div style={{ ...styles.mono, fontSize: 14, fontWeight: 600, color: T.cyan }}>{sn.title}</div>
+              <pre style={{ ...styles.mono, fontSize: 12.5, lineHeight: 1.55, background: T.bg, border: `1px solid ${T.line}`, borderRadius: 6, padding: 12, marginTop: 10, overflowX: "auto", whiteSpace: "pre" }}>{sn.body}</pre>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    /* --------------------------- page: notes -------------------------- */
+
+    function NotesPage({ notes, setNotes, save }) {
+      const [text, setText] = useState("");
+      const submit = () => {
+        if(!text.trim()) return;
+        const n = [{ id: uid(), text, images: [], ts: Date.now() }, ...notes];
+        setNotes(n); save(n); setText("");
+      };
+      return (
+        <div>
+          <div style={{ ...styles.panel, marginBottom: 18 }}>
+            <Eyebrow>New build log entry</Eyebrow>
+            <textarea style={{ ...styles.input, minHeight: 110, marginTop: 6 }} value={text} onChange={(e) => setText(e.target.value)} />
+            <button style={{...styles.btn, marginTop: 10}} onClick={submit}>Save entry</button>
+          </div>
+          {notes.map((note) => (
+            <div key={note.id} style={{ ...styles.panel, marginBottom: 14 }}>
+              <p style={{ fontSize: 14.5, margin: 0, whiteSpace: "pre-wrap" }}>{note.text}</p>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    /* ------------------------------ app ------------------------------- */
+
+    function RoboticArmTracker() {
+      const [page, setPage] = useState("parts");
+      const [loaded, setLoaded] = useState(false);
+      const [parts, setParts] = useState({ stl: DEFAULT_STL, elec: DEFAULT_ELEC });
+      const [snippets, setSnippets] = useState([]);
+      const [notes, setNotes] = useState([]);
+
+      useEffect(() => {
+        (async () => {
+          const [p, c, n] = await Promise.all([sGet(PARTS_KEY), sGet(CODE_KEY), sGet(NOTES_KEY)]);
+          if (p) setParts(p);
+          if (Array.isArray(c)) setSnippets(c);
+          if (Array.isArray(n)) setNotes(n);
+          setLoaded(true);
+        })();
+      }, []);
+
+      const saveParts = useCallback((v) => sSet(PARTS_KEY, v), []);
+      const saveCode = useCallback((v) => sSet(CODE_KEY, v), []);
+      const saveNotes = useCallback((v) => sSet(NOTES_KEY, v), []);
+
+      const pct = Math.round(((parts.stl.filter(i=>i.done).length + parts.elec.filter(i=>i.done).length) / (parts.stl.length + parts.elec.length)) * 100) || 0;
+
+      return (
+        <div style={styles.app}>
+          <style>{FONT_CSS}</style>
+          <header style={{ borderBottom: `1px solid ${T.line}`, background: `${T.panel}EE`, padding: "22px 20px 0" }}>
+            <div style={{ maxWidth: 860, margin: "0 auto" }}>
+              <Eyebrow>Project file</Eyebrow>
+              <h1 style={{ margin: "0 0 16px", fontSize: "clamp(22px, 4.5vw, 32px)", color: "#fff" }}>Robotic Arm <span style={{ color: T.cyan }}>Build Tracker</span></h1>
+              <nav style={{ display: "flex", gap: 4, overflowX: "auto" }}>
+                {[{ id: "parts", label: "Parts" }, { id: "video", label: "Video" }, { id: "code", label: "Code" }, { id: "notes", label: "Log" }].map(p => (
+                  <button key={p.id} onClick={() => setPage(p.id)} style={{ background: page === p.id ? T.bg : "transparent", color: page === p.id ? T.cyan : T.dim, padding: "10px 16px", border: "none", cursor: "pointer", fontWeight: 600 }}>{p.label}</button>
+                ))}
+              </nav>
+            </div>
+          </header>
+          <main style={{ maxWidth: 860, margin: "0 auto", padding: "22px 20px 0" }}>
+            {loaded && page === "parts" && <PartsPage parts={parts} setParts={setParts} save={saveParts} />}
+            {loaded && page === "video" && <VideoPage />}
+            {loaded && page === "code" && <CodePage snippets={snippets} setSnippets={setSnippets} save={saveCode} />}
+            {loaded && page === "notes" && <NotesPage notes={notes} setNotes={setNotes} save={saveNotes} />}
+          </main>
+        </div>
+      );
+    }
+
+    // 4. Tell React to render the app inside the #root div
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<RoboticArmTracker />);
+  </script>
+</body>
+</html>
