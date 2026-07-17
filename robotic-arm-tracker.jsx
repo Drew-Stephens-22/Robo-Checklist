@@ -75,15 +75,15 @@ const IMG_PREFIX = "robotarm:img:";
 
 async function sGet(key) {
   try {
-    const r = await window.storage.get(key);
-    return r ? JSON.parse(r.value) : null;
+    const r = localStorage.getItem(key);
+    return r ? JSON.parse(r) : null;
   } catch {
     return null;
   }
 }
 async function sSet(key, val) {
   try {
-    await window.storage.set(key, JSON.stringify(val));
+    localStorage.setItem(key, JSON.stringify(val));
     return true;
   } catch {
     return false;
@@ -91,7 +91,7 @@ async function sSet(key, val) {
 }
 async function sDel(key) {
   try {
-    await window.storage.delete(key);
+    localStorage.removeItem(key);
   } catch {}
 }
 
