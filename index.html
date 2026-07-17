@@ -236,7 +236,7 @@
       };
 
       const section = (key, title, hint, color) => {
-        const list = parts[key];
+        const list = parts[key] || [];
         const done = list.filter((i) => i.done).length;
         return (
           <div style={{ ...styles.panel, marginBottom: 18 }}>
@@ -249,14 +249,18 @@
         );
       };
 
+      const totalDone = parts.stl.filter(i=>i.done).length + parts.elec.filter(i=>i.done).length + parts.codeLearned.filter(i=>i.done).length;
+      const totalItems = parts.stl.length + parts.elec.length + parts.codeLearned.length;
+
       return (
         <div>
           <div style={{ ...styles.panel, marginBottom: 18, background: T.panelHi }}>
             <Eyebrow>Overall build readiness</Eyebrow>
-            <ProgressBar value={parts.stl.filter(i=>i.done).length + parts.elec.filter(i=>i.done).length} total={parts.stl.length + parts.elec.length} color={T.cyan} />
+            <ProgressBar value={totalDone} total={totalItems} color={T.cyan} />
           </div>
           {section("stl", "Printed parts — 20 STL files", "Click a name to rename.", T.amber)}
           {section("elec", "Electronics & hardware", "Bill of materials.", T.green)}
+          {section("codeLearned", "Code Learned", "Concepts and code learned.", T.red)}
           <div style={styles.panel}>
             <Eyebrow>Add a missing part</Eyebrow>
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 6 }}>
@@ -264,8 +268,9 @@
               <select value={newSection} onChange={(e) => setNewSection(e.target.value)} style={{ ...styles.input, width: "auto", flex: "0 0 auto" }}>
                 <option value="elec">Electronics & hardware</option>
                 <option value="stl">Printed parts</option>
+                <option value="codeLearned">Code Learned</option>
               </select>
-              <button style={styles.btn} onClick={addPart}>Add part</button>
+              <button style={styles.btn} onClick={addPart}>Add</button>
             </div>
           </div>
         </div>
@@ -345,14 +350,17 @@
     function RoboticArmTracker() {
       const [page, setPage] = useState("parts");
       const [loaded, setLoaded] = useState(false);
-      const [parts, setParts] = useState({ stl: DEFAULT_STL, elec: DEFAULT_ELEC });
+      const [parts, setParts] = useState({ stl: DEFAULT_STL, elec: DEFAULT_ELEC, codeLearned: [] });
       const [snippets, setSnippets] = useState([]);
       const [notes, setNotes] = useState([]);
 
       useEffect(() => {
         (async () => {
           const [p, c, n] = await Promise.all([sGet(PARTS_KEY), sGet(CODE_KEY), sGet(NOTES_KEY)]);
-          if (p) setParts(p);
+          if (p) {
+            if (!p.codeLearned) p.codeLearned = []; // Ensure old saves are backwards compatible
+            setParts(p);
+          }
           if (Array.isArray(c)) setSnippets(c);
           if (Array.isArray(n)) setNotes(n);
           setLoaded(true);
@@ -362,8 +370,6 @@
       const saveParts = useCallback((v) => sSet(PARTS_KEY, v), []);
       const saveCode = useCallback((v) => sSet(CODE_KEY, v), []);
       const saveNotes = useCallback((v) => sSet(NOTES_KEY, v), []);
-
-      const pct = Math.round(((parts.stl.filter(i=>i.done).length + parts.elec.filter(i=>i.done).length) / (parts.stl.length + parts.elec.length)) * 100) || 0;
 
       return (
         <div style={styles.app}>
