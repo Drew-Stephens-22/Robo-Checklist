@@ -381,6 +381,30 @@
     const KORIGIN = { x: KW * 0.42, y: KH - 90 };
     const toCanvas = (mx, my) => ({ x: KORIGIN.x + mx * KSCALE, y: KORIGIN.y - my * KSCALE });
 
+    // The ground is drawn 46 canvas px below the shoulder — convert that
+    // into arm coordinates so the physics and the picture agree.
+    const FLOOR_Y = -46 / KSCALE;        // ≈ -74.2 mm below the shoulder
+    const FLOOR_CLEAR = 2;               // mm of clearance kept above it
+    const JAW_LEN = 16 / KSCALE;         // gripper jaw length in mm
+    const JAW_OFF = 7 / KSCALE;          // jaw sideways offset in mm
+
+    // A pose is legal only if nothing pokes below the floor: the elbow,
+    // the wrist, and both gripper jaw tips. (The links themselves are
+    // straight lines between joints that are all above the floor, so
+    // checking the endpoints covers them too.)
+    function poseValid(t1, t2) {
+      const lim = FLOOR_Y + FLOOR_CLEAR;
+      if (L1 * Math.sin(t1) < lim) return false;          // elbow
+      const g = forwardKinematics(t1, t2);
+      if (g.y < lim) return false;                        // wrist
+      const a12 = t1 + t2;
+      for (const s of [1, -1]) {                          // both jaws
+        const baseY = g.y + s * Math.cos(a12) * JAW_OFF;
+        if (baseY < lim || baseY + Math.sin(a12) * JAW_LEN < lim) return false;
+      }
+      return true;
+    }
+
     function Readout({ label, value, unit, color = T.ink }) {
       return (
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "5px 0", borderBottom: `1px dashed ${T.line}` }}>
@@ -401,20 +425,40 @@
       const [target, setTarget] = useState({ x: 240, y: 140 });
       const [angles, setAngles] = useState({ t1: 0.9, t2: -0.9 });
       const trail = useRef([]);
+      const lastValid = useRef({ t1: 0.9, t2: -0.9 });
 
       // Coarse pointer = phone/tablet. Decides which control scheme we offer.
       const isTouch = typeof window !== "undefined" &&
         window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
 
-      /* ---- resolve current pose ---- */
-      let t1, t2, reachable = true;
+      /* ---- resolve current pose (floor-aware) ---- */
+      let t1, t2, reachable = true, floorBlocked = false, autoFlipped = false;
       if (mode === "ik") {
-        const sol = inverseKinematics(target.x, target.y, elbowUp);
-        if (sol) { t1 = sol.t1; t2 = sol.t2; }
-        else {
+        const tryPose = (up) => {
+          const s = inverseKinematics(target.x, target.y, up);
+          return s && poseValid(s.t1, s.t2) ? s : null;
+        };
+        const d2 = target.x * target.x + target.y * target.y;
+        if (d2 > R_MAX * R_MAX || d2 < R_MIN * R_MIN) {
           reachable = false;
+          // point toward the unreachable target — unless even that
+          // gesture would clip the floor, in which case hold position
           t1 = Math.atan2(target.y, target.x);
-          t2 = target.x * target.x + target.y * target.y < R_MIN * R_MIN ? (elbowUp ? 2.8 : -2.8) : 0;
+          t2 = d2 < R_MIN * R_MIN ? (elbowUp ? 2.8 : -2.8) : 0;
+          if (!poseValid(t1, t2)) ({ t1, t2 } = lastValid.current);
+        } else {
+          let sol = tryPose(elbowUp);
+          if (!sol) {
+            sol = tryPose(!elbowUp);      // the mirror pose may clear the floor
+            if (sol) autoFlipped = true;
+          }
+          if (sol) {
+            t1 = sol.t1; t2 = sol.t2;
+            lastValid.current = sol;
+          } else {
+            floorBlocked = true;          // both poses clip — hold last legal pose
+            ({ t1, t2 } = lastValid.current);
+          }
         }
       } else {
         t1 = angles.t1; t2 = angles.t2;
@@ -431,8 +475,25 @@
       };
       const clampTarget = (p) => ({
         x: Math.max(-260, Math.min(420, p.x)),
-        y: Math.max(-120, Math.min(420, p.y)),
+        y: Math.max(FLOOR_Y + FLOOR_CLEAR, Math.min(420, p.y)),   // can't aim underground
       });
+
+      // FK sliders stop at the floor: if the requested angle would clip,
+      // binary-search between the current (legal) angle and the request
+      // to find exactly where the arm touches down.
+      const setAngleSafe = (key, valRad) => {
+        setAngles((a) => {
+          const cand = { ...a, [key]: valRad };
+          if (poseValid(cand.t1, cand.t2)) return cand;
+          let lo = a[key], hi = valRad;
+          for (let i = 0; i < 24; i++) {
+            const mid = (lo + hi) / 2;
+            const test = { ...a, [key]: mid };
+            if (poseValid(test.t1, test.t2)) lo = mid; else hi = mid;
+          }
+          return { ...a, [key]: lo };
+        });
+      };
 
       /* ---- desktop: pointer lock ("steal" the mouse) ---- */
       useEffect(() => {
@@ -506,12 +567,23 @@
           ctx.setLineDash([]);
         });
 
-        ctx.strokeStyle = T.line;
-        ctx.lineWidth = 1.5;
+        // the floor — solid ground, hatched underneath, red when the arm
+        // is pressing against it
+        const gy = KORIGIN.y + 46;
+        ctx.strokeStyle = floorBlocked ? T.red : T.line;
+        ctx.lineWidth = floorBlocked ? 2.5 : 1.5;
         ctx.beginPath();
-        ctx.moveTo(20, KORIGIN.y + 46);
-        ctx.lineTo(KW - 20, KORIGIN.y + 46);
+        ctx.moveTo(20, gy);
+        ctx.lineTo(KW - 20, gy);
         ctx.stroke();
+        ctx.strokeStyle = (floorBlocked ? T.red : T.line) + "66";
+        ctx.lineWidth = 1;
+        for (let hx = 28; hx < KW - 20; hx += 18) {
+          ctx.beginPath();
+          ctx.moveTo(hx, gy + 2);
+          ctx.lineTo(hx - 9, gy + 11);
+          ctx.stroke();
+        }
         ctx.fillStyle = T.panelHi;
         ctx.strokeStyle = T.line;
         ctx.beginPath();
@@ -641,14 +713,15 @@
                 <div>
                   <div style={{ ...styles.mono, fontSize: 11.5, color: T.green, marginBottom: 2 }}>θ1 shoulder — {deg(angles.t1).toFixed(1)}°</div>
                   <input type="range" min={-30} max={200} step={0.5} value={deg(angles.t1)}
-                    onChange={(e) => setAngles(a => ({ ...a, t1: e.target.value * Math.PI / 180 }))}
+                    onChange={(e) => setAngleSafe("t1", e.target.value * Math.PI / 180)}
                     style={{ width: "100%", accentColor: T.green }} />
                   <div style={{ ...styles.mono, fontSize: 11.5, color: T.amber, margin: "10px 0 2px" }}>θ2 elbow — {deg(angles.t2).toFixed(1)}°</div>
                   <input type="range" min={-160} max={160} step={0.5} value={deg(angles.t2)}
-                    onChange={(e) => setAngles(a => ({ ...a, t2: e.target.value * Math.PI / 180 }))}
+                    onChange={(e) => setAngleSafe("t2", e.target.value * Math.PI / 180)}
                     style={{ width: "100%", accentColor: T.amber }} />
                   <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 10 }}>
-                    FK never fails — every pair of angles lands the gripper somewhere.
+                    Every angle pair lands the gripper somewhere — but the sliders
+                    stop where the arm would hit the floor.
                   </div>
                 </div>
               ) : (
@@ -671,10 +744,14 @@
               <Readout label="GRIPPER X (FK)" value={fmtN(grip.x)} unit="mm" />
               <Readout label="GRIPPER Y (FK)" value={fmtN(grip.y)} unit="mm" />
               {mode === "ik" && <Readout label="TARGET DIST" value={fmtN(dist)} unit="mm" color={reachable ? T.ink : T.red} />}
-              <div style={{ ...styles.mono, fontSize: 11, marginTop: 10, color: reachable ? T.green : T.red }}>
-                {reachable
-                  ? "REACHABLE — IK solved, FK round-trip matches target"
-                  : `UNREACHABLE — need ${R_MIN.toFixed(0)} ≤ d ≤ ${R_MAX.toFixed(0)} mm`}
+              <div style={{ ...styles.mono, fontSize: 11, marginTop: 10, color: floorBlocked ? T.red : !reachable ? T.red : autoFlipped ? T.amber : T.green }}>
+                {floorBlocked
+                  ? "FLOOR CONTACT — both elbow poses would clip the ground, holding last legal pose"
+                  : !reachable
+                  ? `UNREACHABLE — need ${R_MIN.toFixed(0)} ≤ d ≤ ${R_MAX.toFixed(0)} mm`
+                  : autoFlipped
+                  ? "REACHABLE — elbow auto-flipped to keep the arm above the floor"
+                  : "REACHABLE — IK solved, FK round-trip matches target"}
               </div>
             </div>
 
