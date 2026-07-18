@@ -11,6 +11,7 @@
   
   <!-- 2. Load Babel to translate JSX in the browser -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
   
   <style>
     body { margin: 0; padding: 0; }
@@ -348,8 +349,9 @@
     /* ------------------------ page: kinematics ------------------------ */
     /*  Interactive FK / IK demo. Link lengths measured pivot-to-pivot     */
     /*  from the STLs: L1 = 199.4 mm (Alt_Kol), L2 = 140.0 mm (On_Kol).    */
-    /*  Desktop: click canvas -> pointer lock ("steals" the mouse).        */
-    /*  Phone:   touch and drag the canvas directly.                       */
+    /*  2D view: the planar schematic (pointer lock on desktop, touch      */
+    /*  drag on phone). 3D view: adds the real arm's rotating base (th0)   */
+    /*  and shows how 3D IK reduces to the same 2D triangle.               */
 
     const L1 = 199.4, L2 = 140.0;
     const R_MAX = L1 + L2, R_MIN = Math.abs(L1 - L2);
@@ -381,32 +383,223 @@
     const KORIGIN = { x: KW * 0.42, y: KH - 90 };
     const toCanvas = (mx, my) => ({ x: KORIGIN.x + mx * KSCALE, y: KORIGIN.y - my * KSCALE });
 
-    // The ground is drawn 46 canvas px below the shoulder — convert that
-    // into arm coordinates so the physics and the picture agree.
-    const FLOOR_Y = -46 / KSCALE;        // ≈ -74.2 mm below the shoulder
+    // The ground in arm coordinates (drawn 46 px below the shoulder).
+    const FLOOR_Y = -46 / KSCALE;        // approx -74.2 mm below the shoulder
     const FLOOR_CLEAR = 2;               // mm of clearance kept above it
     const JAW_LEN = 16 / KSCALE;         // gripper jaw length in mm
     const JAW_OFF = 7 / KSCALE;          // jaw sideways offset in mm
 
-    // A pose is legal only if nothing pokes below the floor: the elbow,
-    // the wrist, and both gripper jaw tips. (The links themselves are
-    // straight lines between joints that are all above the floor, so
-    // checking the endpoints covers them too.)
+    // A pose is legal only if nothing pokes below the floor: elbow, wrist
+    // and both jaw tips. The same check covers 2D and 3D — in 3D the arm
+    // lives in a vertical plane rotated by th0, and the floor is the same
+    // height in every one of those planes.
     function poseValid(t1, t2) {
       const lim = FLOOR_Y + FLOOR_CLEAR;
-      if (L1 * Math.sin(t1) < lim) return false;          // elbow
+      if (L1 * Math.sin(t1) < lim) return false;
       const g = forwardKinematics(t1, t2);
-      if (g.y < lim) return false;                        // wrist
+      if (g.y < lim) return false;
       const a12 = t1 + t2;
-      for (const s of [1, -1]) {                          // both jaws
+      for (const s of [1, -1]) {
         const baseY = g.y + s * Math.cos(a12) * JAW_OFF;
         if (baseY < lim || baseY + Math.sin(a12) * JAW_LEN < lim) return false;
       }
       return true;
     }
 
-    function Readout({ label, value, unit, color = T.ink }) {
-      return (
+    // Shared floor-aware planar solver: target (tx, ty) in the arm's
+    // vertical plane -> pose + status flags. Both views run through this.
+    function resolvePlanar(tx, ty, elbowUp, lastRef) {
+      const out = { t1: 0, t2: 0, reachable: true, floorBlocked: false, autoFlipped: false };
+      const tryPose = (up) => {
+        const s = inverseKinematics(tx, ty, up);
+        return s && poseValid(s.t1, s.t2) ? s : null;
+      };
+      const d2 = tx * tx + ty * ty;
+      if (d2 > R_MAX * R_MAX || d2 < R_MIN * R_MIN) {
+        out.reachable = false;
+        out.t1 = Math.atan2(ty, tx);
+        out.t2 = d2 < R_MIN * R_MIN ? (elbowUp ? 2.8 : -2.8) : 0;
+        if (!poseValid(out.t1, out.t2)) { out.t1 = lastRef.current.t1; out.t2 = lastRef.current.t2; }
+      } else {
+        let sol = tryPose(elbowUp);
+        if (!sol) {
+          sol = tryPose(!elbowUp);
+          if (sol) out.autoFlipped = true;
+        }
+        if (sol) {
+          out.t1 = sol.t1; out.t2 = sol.t2;
+          lastRef.current = { t1: sol.t1, t2: sol.t2 };
+        } else {
+          out.floorBlocked = true;
+          out.t1 = lastRef.current.t1; out.t2 = lastRef.current.t2;
+        }
+      }
+      return out;
+    }
+
+    /* ---- the matching Arduino sketch, seeded into the Code tab ---- */
+    const ARM_3DOF_SKETCH = `/*
+ * THREE-DOF ROBOTIC ARM - base yaw + shoulder + elbow
+ * Matches the 3D Kinematics Lab simulation on this site: same link
+ * lengths, same IK, same floor guard, same elbow auto-flip.
+ *
+ * Link lengths measured pivot-to-pivot from the printed parts:
+ *   L1 = 199.4 mm  (Alt_Kol: shoulder bearing -> elbow gear axis)
+ *   L2 = 140.0 mm  (On_Kol: elbow hole -> wrist bore)
+ *
+ * Wiring (change pins to suit):
+ *   base servo     -> pin 9    (Alt_Govde / Tabla_Alt turntable)
+ *   shoulder servo -> pin 10
+ *   elbow servo    -> pin 11
+ *   Servos on their OWN 5-6V supply, grounds tied to the Uno.
+ *
+ * Use: open Serial Monitor at 115200, type a target in mm:
+ *   x y z      e.g.  200 120 110
+ * x = forward, y = height above the shoulder pivot, z = sideways.
+ * The arm slews there smoothly. Type  home  to return to start.
+ */
+
+#include <Servo.h>
+#include <math.h>
+
+// ---------------- measured geometry ----------------
+const float L1 = 199.4;
+const float L2 = 140.0;
+const float R_MAX = L1 + L2;
+const float R_MIN = fabs(L1 - L2);
+
+// Table height relative to the shoulder pivot, in mm (negative = below).
+// MEASURE YOURS: shoulder shaft center straight down to the table top.
+const float FLOOR_MM   = -140.0;
+const float FLOOR_CLEAR = 3.0;
+
+// ---------------- servos + calibration ----------------
+Servo baseServo, shoulderServo, elbowServo;
+const int BASE_PIN = 9, SHOULDER_PIN = 10, ELBOW_PIN = 11;
+
+// Map math angles (deg) to servo.write() values. Tune on YOUR hardware:
+// OFFSET = servo value when the math angle is 0; DIR = 1 or -1 to flip.
+const float BASE_OFFSET = 90,  BASE_DIR = 1;
+const float SHOULDER_OFFSET = 0,  SHOULDER_DIR = 1;
+const float ELBOW_OFFSET = 90, ELBOW_DIR = 1;
+
+const bool ELBOW_UP_FIRST = true;   // preferred elbow solution
+
+// smooth motion: current + goal angles in MATH degrees
+float cur0 = 0, cur1 = 90, cur2 = -90;
+float goal0 = 0, goal1 = 90, goal2 = -90;
+const float STEP_DEG = 1.2;         // deg per 20 ms tick (lower = smoother)
+unsigned long lastTick = 0;
+
+// ---------------- kinematics ----------------
+// Floor guard, same idea as the simulation: elbow and wrist must stay
+// above the table. (Add a jaw-tip check like the sim if you need it.)
+bool poseValid(float t1, float t2) {
+  float lim = FLOOR_MM + FLOOR_CLEAR;
+  if (L1 * sin(t1) < lim) return false;
+  float wristY = L1 * sin(t1) + L2 * sin(t1 + t2);
+  return wristY >= lim;
+}
+
+// Step 0 of 3D IK: base yaw aims at the target, then the problem
+// collapses to the same 2-link triangle in the (r, y) vertical plane.
+bool solveIK(float x, float y, float z, float &t0, float &t1, float &t2) {
+  t0 = atan2(z, x);
+  float r = sqrt(x * x + z * z);
+
+  float d2 = r * r + y * y;
+  if (d2 > R_MAX * R_MAX || d2 < R_MIN * R_MIN) return false;  // out of ring
+
+  float c2 = (d2 - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
+  c2 = constrain(c2, -1.0, 1.0);
+  t2 = acos(c2);
+  if (!ELBOW_UP_FIRST) t2 = -t2;
+  t1 = atan2(y, r) - atan2(L2 * sin(t2), L1 + L2 * cos(t2));
+
+  if (!poseValid(t1, t2)) {
+    // mirror pose may clear the floor - auto-flip like the simulation
+    float a2 = -t2;
+    float a1 = atan2(y, r) - atan2(L2 * sin(a2), L1 + L2 * cos(a2));
+    if (!poseValid(a1, a2)) return false;                      // both clip
+    t1 = a1; t2 = a2;
+  }
+  return true;
+}
+
+// ---------------- servo output ----------------
+bool anglesToServos(float d0, float d1, float d2v,
+                    float &s0, float &s1, float &s2) {
+  s0 = BASE_OFFSET + BASE_DIR * d0;
+  s1 = SHOULDER_OFFSET + SHOULDER_DIR * d1;
+  s2 = ELBOW_OFFSET + ELBOW_DIR * d2v;
+  return s0 >= 0 && s0 <= 180 && s1 >= 0 && s1 <= 180 && s2 >= 0 && s2 <= 180;
+}
+
+void writeCurrent() {
+  float s0, s1, s2;
+  if (anglesToServos(cur0, cur1, cur2, s0, s1, s2)) {
+    baseServo.write((int)s0);
+    shoulderServo.write((int)s1);
+    elbowServo.write((int)s2);
+  }
+}
+
+// ---------------- main ----------------
+void setup() {
+  Serial.begin(115200);
+  baseServo.attach(BASE_PIN);
+  shoulderServo.attach(SHOULDER_PIN);
+  elbowServo.attach(ELBOW_PIN);
+  writeCurrent();   // known safe pose: arm folded up
+
+  Serial.println(F("3-DOF arm ready. Target as: x y z   (mm)"));
+  Serial.print(F("Reach ring: "));
+  Serial.print(R_MIN); Serial.print(F(" to ")); Serial.print(R_MAX);
+  Serial.println(F(" mm from the shoulder."));
+}
+
+void loop() {
+  // ---- accept new targets ----
+  if (Serial.available()) {
+    if (Serial.peek() == 'h') {                       // "home"
+      while (Serial.available()) Serial.read();
+      goal0 = 0; goal1 = 90; goal2 = -90;
+      Serial.println(F("homing"));
+    } else {
+      float x = Serial.parseFloat();
+      float y = Serial.parseFloat();
+      float z = Serial.parseFloat();
+      while (Serial.available()) Serial.read();
+
+      float t0, t1, t2;
+      if (!solveIK(x, y, z, t0, t1, t2)) {
+        Serial.println(F("unreachable (ring or floor) - ignored"));
+      } else {
+        float s0, s1, s2;
+        if (!anglesToServos(degrees(t0), degrees(t1), degrees(t2), s0, s1, s2)) {
+          Serial.println(F("outside servo 0-180 range - ignored"));
+        } else {
+          goal0 = degrees(t0); goal1 = degrees(t1); goal2 = degrees(t2);
+          Serial.print(F("IK: base "));  Serial.print(goal0, 1);
+          Serial.print(F("  shoulder ")); Serial.print(goal1, 1);
+          Serial.print(F("  elbow "));    Serial.println(goal2, 1);
+        }
+      }
+    }
+  }
+
+  // ---- slew smoothly toward the goal every 20 ms ----
+  if (millis() - lastTick >= 20) {
+    lastTick = millis();
+    cur0 += constrain(goal0 - cur0, -STEP_DEG, STEP_DEG);
+    cur1 += constrain(goal1 - cur1, -STEP_DEG, STEP_DEG);
+    cur2 += constrain(goal2 - cur2, -STEP_DEG, STEP_DEG);
+    writeCurrent();
+  }
+}
+`;
+
+    function Readout({ label, value, unit, color = T.ink }) {      return (
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "5px 0", borderBottom: `1px dashed ${T.line}` }}>
           <span style={{ ...styles.mono, fontSize: 11.5, color: T.dim, letterSpacing: "0.06em" }}>{label}</span>
           <span style={{ ...styles.mono, fontSize: 14, fontWeight: 600, color }}>
@@ -416,55 +609,405 @@
       );
     }
 
+    /* -------------------- 3D view (three.js scene) --------------------- */
+    /*  Joint hierarchy mirrors the math exactly:                          */
+    /*    baseGroup (yaw th0) > link1 (pitch th1) > link2 (pitch th2)      */
+    /*  Drag the green target ball to move it, drag empty space to orbit,  */
+    /*  wheel / pinch to zoom. Works with mouse and touch alike.           */
+
+    const C3 = { cyan: 0x5CC8FF, green: 0x63E6A8, amber: 0xFFB454, red: 0xFF7B7B, line: 0x23405F, hi: 0x18304C, dim: 0x7FA0C0, bg: 0x0C1826 };
+
+    function Arm3D({ pose, target, onDragTarget, onSetHeight }) {
+      const mountRef = useRef(null);
+      const propsRef = useRef({ pose, target });
+      propsRef.current = { pose, target };
+      const cbRef = useRef(onDragTarget);
+      cbRef.current = onDragTarget;
+      const cbHeightRef = useRef(onSetHeight);
+      cbHeightRef.current = onSetHeight;
+
+      useEffect(() => {
+        if (!window.THREE) return;
+        const THREE = window.THREE;
+        const mount = mountRef.current;
+        const width = mount.clientWidth;
+        const height = Math.round(Math.min(480, Math.max(300, width * 0.62)));
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        renderer.setSize(width, height);
+        renderer.setClearColor(C3.bg, 1);
+        renderer.domElement.style.borderRadius = "6px";
+        renderer.domElement.style.touchAction = "none";
+        renderer.domElement.style.width = "100%";
+        renderer.domElement.style.display = "block";
+        mount.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, width / height, 10, 4000);
+        const camCenter = new THREE.Vector3(0, 60, 0);
+        const cam = { yaw: 0.7, pitch: 0.42, radius: 780 };
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+        const sun = new THREE.DirectionalLight(0xffffff, 0.7);
+        sun.position.set(300, 500, 200);
+        scene.add(sun);
+
+        /* ground */
+        const grid = new THREE.GridHelper(900, 22, C3.line, C3.line);
+        grid.position.y = FLOOR_Y;
+        grid.material.transparent = true;
+        grid.material.opacity = 0.5;
+        scene.add(grid);
+
+        // reach rings projected on the floor (where the ring intersects it)
+        const ringMat = new THREE.LineBasicMaterial({ color: C3.cyan, transparent: true, opacity: 0.35 });
+        [R_MIN, R_MAX].forEach((r) => {
+          const rr = Math.sqrt(Math.max(0, r * r - FLOOR_Y * FLOOR_Y));
+          if (rr <= 0) return;
+          const pts = [];
+          for (let i = 0; i <= 72; i++) {
+            const a = (i / 72) * Math.PI * 2;
+            pts.push(new THREE.Vector3(Math.cos(a) * rr, FLOOR_Y + 0.5, Math.sin(a) * rr));
+          }
+          scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), ringMat));
+        });
+
+        // reach shells around the shoulder
+        [R_MIN, R_MAX].forEach((r) => {
+          const sh = new THREE.Mesh(
+            new THREE.SphereGeometry(r, 24, 16),
+            new THREE.MeshBasicMaterial({ color: C3.cyan, wireframe: true, transparent: true, opacity: 0.06 })
+          );
+          scene.add(sh);
+        });
+
+        /* pedestal: floor up to the shoulder */
+        const pedestal = new THREE.Mesh(
+          new THREE.CylinderGeometry(42, 55, -FLOOR_Y, 24),
+          new THREE.MeshLambertMaterial({ color: C3.hi })
+        );
+        pedestal.position.y = FLOOR_Y / 2;
+        scene.add(pedestal);
+
+        /* the arm hierarchy */
+        const linkMat = new THREE.MeshLambertMaterial({ color: C3.cyan });
+        const link2Mat = new THREE.MeshLambertMaterial({ color: C3.cyan });
+        const jointMat = new THREE.MeshLambertMaterial({ color: 0xffffff, emissive: C3.hi });
+        const jawMat = new THREE.MeshLambertMaterial({ color: C3.amber });
+
+        const baseGroup = new THREE.Group();
+        scene.add(baseGroup);
+
+        const shoulderBall = new THREE.Mesh(new THREE.SphereGeometry(14, 20, 14), jointMat);
+        baseGroup.add(shoulderBall);
+
+        const link1Group = new THREE.Group();
+        baseGroup.add(link1Group);
+        const link1 = new THREE.Mesh(new THREE.BoxGeometry(L1, 20, 13), linkMat);
+        link1.position.x = L1 / 2;
+        link1Group.add(link1);
+
+        const elbowGroup = new THREE.Group();
+        elbowGroup.position.x = L1;
+        link1Group.add(elbowGroup);
+        const elbowBall = new THREE.Mesh(new THREE.SphereGeometry(11, 18, 12), jointMat);
+        elbowGroup.add(elbowBall);
+        const link2 = new THREE.Mesh(new THREE.BoxGeometry(L2, 15, 10), link2Mat);
+        link2.position.x = L2 / 2;
+        elbowGroup.add(link2);
+
+        const wristGroup = new THREE.Group();
+        wristGroup.position.x = L2;
+        elbowGroup.add(wristGroup);
+        const wristBall = new THREE.Mesh(new THREE.SphereGeometry(8, 16, 10), jointMat);
+        wristGroup.add(wristBall);
+        for (const s of [1, -1]) {
+          const jaw = new THREE.Mesh(new THREE.BoxGeometry(JAW_LEN, 4, 4), jawMat);
+          jaw.position.set(JAW_LEN / 2, s * JAW_OFF, 0);
+          wristGroup.add(jaw);
+        }
+
+        /* target ball + vertical drop line */
+        const targetBall = new THREE.Mesh(
+          new THREE.SphereGeometry(10, 18, 12),
+          new THREE.MeshLambertMaterial({ color: C3.green, emissive: 0x1a4030 })
+        );
+        scene.add(targetBall);
+        const hitBall = new THREE.Mesh(
+          new THREE.SphereGeometry(20, 8, 6),
+          new THREE.MeshBasicMaterial({ visible: false })
+        );
+        scene.add(hitBall);
+        const dropMat = new THREE.LineBasicMaterial({ color: C3.green, transparent: true, opacity: 0.45 });
+        const dropGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+        const dropLine = new THREE.Line(dropGeo, dropMat);
+        scene.add(dropLine);
+
+        /* lift handle: a stem + arrow above the ball, drag it to change height.
+           Its hit zone starts ABOVE the ball's hit sphere (no overlap), so a
+           grab is unambiguous: ball = horizontal, handle = vertical. */
+        const liftGroup = new THREE.Group();
+        const handleMat = new THREE.MeshLambertMaterial({ color: C3.amber, emissive: 0x2a1c08 });
+        const stem = new THREE.Mesh(new THREE.CylinderGeometry(2.5, 2.5, 36, 10), handleMat);
+        stem.position.y = 42;
+        liftGroup.add(stem);
+        const arrowUp = new THREE.Mesh(new THREE.ConeGeometry(9, 16, 12), handleMat);
+        arrowUp.position.y = 68;
+        liftGroup.add(arrowUp);
+        const hitHandle = new THREE.Mesh(
+          new THREE.CylinderGeometry(13, 13, 52, 8),
+          new THREE.MeshBasicMaterial({ visible: false })
+        );
+        hitHandle.position.y = 50;   // spans 24..76 above the ball — gap below
+        liftGroup.add(hitHandle);
+        scene.add(liftGroup);
+
+        /* drag guides: show WHICH move is active while dragging */
+        const guideVert = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+          new THREE.LineBasicMaterial({ color: C3.amber, transparent: true, opacity: 0.8 })
+        );
+        guideVert.visible = false;
+        scene.add(guideVert);
+        const guideDisc = new THREE.Mesh(
+          new THREE.RingGeometry(24, 64, 40),
+          new THREE.MeshBasicMaterial({ color: C3.green, transparent: true, opacity: 0.16, side: THREE.DoubleSide })
+        );
+        guideDisc.rotation.x = -Math.PI / 2;
+        guideDisc.visible = false;
+        scene.add(guideDisc);
+
+        /* interaction: drag target vs orbit camera, wheel / pinch zoom */
+        const ray = new THREE.Raycaster();
+        const ndc = new THREE.Vector2();
+        const pointers = new Map();
+        let dragMode = null;        // "target" | "lift" | "orbit" | "pinch"
+        let prevPinch = 0;
+        let liftOffset = 0;         // grab offset so the ball doesn't jump
+
+        const setNDC = (e) => {
+          const rect = renderer.domElement.getBoundingClientRect();
+          ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        };
+
+        // Height under the pointer: closest point between the mouse ray and
+        // the vertical line through the target — the standard 3D-gizmo trick.
+        const heightAtRay = () => {
+          const t = propsRef.current.target;
+          const o = ray.ray.origin, d = ray.ray.direction;
+          const b = d.y;
+          const den = 1 - b * b;
+          if (Math.abs(den) < 1e-4) return null;     // looking straight up/down
+          const wx = o.x - t.x, wy = o.y, wz = o.z - t.z;
+          const d0 = d.x * wx + d.y * wy + d.z * wz;
+          return (wy - b * d0) / den;
+        };
+
+        const onDown = (e) => {
+          renderer.domElement.setPointerCapture(e.pointerId);
+          pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+          if (pointers.size === 2) { dragMode = "pinch"; prevPinch = 0; return; }
+          setNDC(e);
+          ray.setFromCamera(ndc, camera);
+          // pick whichever zone the ray actually hits FIRST — no overlap,
+          // no ambiguity. Shift+ball is the only extra way into lift mode.
+          const hits = ray.intersectObjects([hitBall, hitHandle]);
+          if (hits.length === 0) {
+            dragMode = "orbit";
+          } else if (hits[0].object === hitHandle || e.shiftKey) {
+            dragMode = "lift";
+            const h = heightAtRay();
+            liftOffset = h === null ? 0 : propsRef.current.target.y - h;
+          } else {
+            dragMode = "target";
+          }
+          renderer.domElement.style.cursor = "grabbing";
+        };
+        const hover = (e) => {
+          // idle mouse: show what a grab here would do
+          setNDC(e);
+          ray.setFromCamera(ndc, camera);
+          const hits = ray.intersectObjects([hitBall, hitHandle]);
+          const over = hits.length ? hits[0].object : null;
+          handleMat.emissive.setHex(over === hitHandle ? 0x6b4a12 : 0x2a1c08);
+          targetBall.material.emissive.setHex(over === hitBall ? 0x2e7050 : 0x1a4030);
+          renderer.domElement.style.cursor =
+            over === hitHandle ? "ns-resize" : over === hitBall ? "grab" : "";
+        };
+        const onMove = (e) => {
+          if (!dragMode && e.pointerType === "mouse") { hover(e); return; }
+          const prev = pointers.get(e.pointerId);
+          if (!prev) return;
+          const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+          pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+          if (dragMode === "pinch" && pointers.size === 2) {
+            const [a, b] = [...pointers.values()];
+            const d = Math.hypot(a.x - b.x, a.y - b.y);
+            if (prevPinch) cam.radius = Math.max(320, Math.min(1400, cam.radius * (prevPinch / d)));
+            prevPinch = d;
+            return;
+          }
+          if (dragMode === "lift") {
+            e.preventDefault();
+            setNDC(e);
+            ray.setFromCamera(ndc, camera);
+            const h = heightAtRay();
+            if (h !== null) cbHeightRef.current(h + liftOffset);
+          } else if (dragMode === "target") {
+            e.preventDefault();
+            setNDC(e);
+            ray.setFromCamera(ndc, camera);
+            const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -propsRef.current.target.y);
+            const hit = new THREE.Vector3();
+            if (ray.ray.intersectPlane(plane, hit)) cbRef.current(hit.x, hit.z);
+          } else if (dragMode === "orbit") {
+            cam.yaw -= dx * 0.006;
+            cam.pitch = Math.max(0.06, Math.min(1.35, cam.pitch + dy * 0.005));
+          }
+        };
+        const endDrag = (e) => {
+          if (e && e.pointerId !== undefined) pointers.delete(e.pointerId);
+          if (pointers.size < 2 && dragMode === "pinch") dragMode = "orbit";
+          if (pointers.size === 0) {
+            dragMode = null;                      // ALWAYS fully release the mode
+            renderer.domElement.style.cursor = "";
+          }
+        };
+        const onUp = endDrag;
+        const onWheel = (e) => {
+          e.preventDefault();
+          if (e.shiftKey) {
+            // Shift+scroll trims the target height instead of zooming
+            cbHeightRef.current(propsRef.current.target.y - e.deltaY * 0.2);
+            return;
+          }
+          cam.radius = Math.max(320, Math.min(1400, cam.radius * (1 + e.deltaY * 0.001)));
+        };
+        renderer.domElement.addEventListener("pointerdown", onDown);
+        renderer.domElement.addEventListener("pointermove", onMove);
+        renderer.domElement.addEventListener("pointerup", onUp);
+        renderer.domElement.addEventListener("pointercancel", onUp);
+        renderer.domElement.addEventListener("lostpointercapture", onUp);
+        renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+
+        const onResize = () => {
+          const w = mount.clientWidth;
+          const h = Math.round(Math.min(480, Math.max(300, w * 0.62)));
+          renderer.setSize(w, h);
+          camera.aspect = w / h;
+          camera.updateProjectionMatrix();
+        };
+        window.addEventListener("resize", onResize);
+
+        /* render loop */
+        let raf;
+        const tick = () => {
+          const { pose: p, target: t } = propsRef.current;
+          baseGroup.rotation.y = -p.t0;
+          link1Group.rotation.z = p.t1;
+          elbowGroup.rotation.z = p.t2;
+
+          const bad = p.floorBlocked || !p.reachable;
+          linkMat.color.setHex(bad ? C3.red : C3.cyan);
+          link2Mat.color.setHex(bad ? C3.red : C3.cyan);
+          targetBall.material.color.setHex(p.reachable && !p.floorBlocked ? C3.green : C3.red);
+
+          targetBall.position.set(t.x, t.y, t.z);
+          hitBall.position.copy(targetBall.position);
+          liftGroup.position.copy(targetBall.position);
+
+          // guides make the active move unmistakable
+          guideDisc.visible = dragMode === "target";
+          guideDisc.position.set(t.x, t.y, t.z);
+          guideVert.visible = dragMode === "lift";
+          const gv = guideVert.geometry.attributes.position.array;
+          gv[0] = t.x; gv[1] = FLOOR_Y; gv[2] = t.z;
+          gv[3] = t.x; gv[4] = 410; gv[5] = t.z;
+          guideVert.geometry.attributes.position.needsUpdate = true;
+          const dp = dropGeo.attributes.position.array;
+          dp[0] = t.x; dp[1] = FLOOR_Y; dp[2] = t.z;
+          dp[3] = t.x; dp[4] = t.y; dp[5] = t.z;
+          dropGeo.attributes.position.needsUpdate = true;
+
+          camera.position.set(
+            camCenter.x + cam.radius * Math.cos(cam.pitch) * Math.cos(cam.yaw),
+            camCenter.y + cam.radius * Math.sin(cam.pitch),
+            camCenter.z + cam.radius * Math.cos(cam.pitch) * Math.sin(cam.yaw)
+          );
+          camera.lookAt(camCenter);
+          renderer.render(scene, camera);
+          raf = requestAnimationFrame(tick);
+        };
+        tick();
+
+        return () => {
+          cancelAnimationFrame(raf);
+          window.removeEventListener("resize", onResize);
+          renderer.domElement.removeEventListener("pointerdown", onDown);
+          renderer.domElement.removeEventListener("pointermove", onMove);
+          renderer.domElement.removeEventListener("pointerup", onUp);
+          renderer.domElement.removeEventListener("pointercancel", onUp);
+          renderer.domElement.removeEventListener("lostpointercapture", onUp);
+          renderer.domElement.removeEventListener("wheel", onWheel);
+          mount.removeChild(renderer.domElement);
+          renderer.dispose();
+        };
+      }, []);
+
+      if (!window.THREE) {
+        return <div style={{ ...styles.mono, fontSize: 12, color: T.dim, padding: 20 }}>
+          3D view needs three.js from the CDN — check your connection and reload.
+        </div>;
+      }
+      return <div ref={mountRef} />;
+    }
+
+    /* --------------------------- the page ------------------------------ */
+
     function KinematicsPage() {
       const canvasRef = useRef(null);
+      const [view, setView] = useState("2d");
       const [locked, setLocked] = useState(false);
       const [touching, setTouching] = useState(false);
       const [mode, setMode] = useState("ik");
       const [elbowUp, setElbowUp] = useState(true);
-      const [target, setTarget] = useState({ x: 240, y: 140 });
-      const [angles, setAngles] = useState({ t1: 0.9, t2: -0.9 });
+      const [target, setTarget] = useState({ x: 240, y: 140 });          // 2D target (mm)
+      const [target3, setTarget3] = useState({ x: 200, y: 120, z: 110 }); // 3D target (mm)
+      const [angles, setAngles] = useState({ t1: 0.9, t2: -0.9 });        // 2D FK sliders
+      const [angles3, setAngles3] = useState({ t0: 0.5, t1: 0.9, t2: -0.9 }); // 3D FK sliders
       const trail = useRef([]);
       const lastValid = useRef({ t1: 0.9, t2: -0.9 });
+      const lastValid3 = useRef({ t1: 0.9, t2: -0.9 });
 
-      // Coarse pointer = phone/tablet. Decides which control scheme we offer.
       const isTouch = typeof window !== "undefined" &&
         window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
 
-      /* ---- resolve current pose (floor-aware) ---- */
-      let t1, t2, reachable = true, floorBlocked = false, autoFlipped = false;
-      if (mode === "ik") {
-        const tryPose = (up) => {
-          const s = inverseKinematics(target.x, target.y, up);
-          return s && poseValid(s.t1, s.t2) ? s : null;
-        };
-        const d2 = target.x * target.x + target.y * target.y;
-        if (d2 > R_MAX * R_MAX || d2 < R_MIN * R_MIN) {
-          reachable = false;
-          // point toward the unreachable target — unless even that
-          // gesture would clip the floor, in which case hold position
-          t1 = Math.atan2(target.y, target.x);
-          t2 = d2 < R_MIN * R_MIN ? (elbowUp ? 2.8 : -2.8) : 0;
-          if (!poseValid(t1, t2)) ({ t1, t2 } = lastValid.current);
+      /* ---- resolve current pose (floor-aware, shared solver) ---- */
+      let t0 = 0, t1, t2, reachable = true, floorBlocked = false, autoFlipped = false;
+      let rHoriz = 0;
+      if (view === "2d") {
+        if (mode === "ik") {
+          const r = resolvePlanar(target.x, target.y, elbowUp, lastValid);
+          ({ t1, t2, reachable, floorBlocked, autoFlipped } = r);
         } else {
-          let sol = tryPose(elbowUp);
-          if (!sol) {
-            sol = tryPose(!elbowUp);      // the mirror pose may clear the floor
-            if (sol) autoFlipped = true;
-          }
-          if (sol) {
-            t1 = sol.t1; t2 = sol.t2;
-            lastValid.current = sol;
-          } else {
-            floorBlocked = true;          // both poses clip — hold last legal pose
-            ({ t1, t2 } = lastValid.current);
-          }
+          t1 = angles.t1; t2 = angles.t2;
         }
       } else {
-        t1 = angles.t1; t2 = angles.t2;
+        if (mode === "ik") {
+          // 3D -> 2D reduction: base yaw from atan2, then the same triangle
+          rHoriz = Math.hypot(target3.x, target3.z);
+          t0 = Math.atan2(target3.z, target3.x);
+          const r = resolvePlanar(rHoriz, target3.y, elbowUp, lastValid3);
+          ({ t1, t2, reachable, floorBlocked, autoFlipped } = r);
+        } else {
+          t0 = angles3.t0; t1 = angles3.t1; t2 = angles3.t2;
+        }
       }
       const elbow = { x: L1 * Math.cos(t1), y: L1 * Math.sin(t1) };
-      const grip = forwardKinematics(t1, t2);
+      const grip = forwardKinematics(t1, t2);   // planar (r, height)
+      const grip3 = { x: Math.cos(t0) * grip.x, y: grip.y, z: Math.sin(t0) * grip.x };
 
       /* ---- shared: canvas client coords -> arm world coords (mm) ---- */
       const clientToWorld = (clientX, clientY) => {
@@ -475,14 +1018,13 @@
       };
       const clampTarget = (p) => ({
         x: Math.max(-260, Math.min(420, p.x)),
-        y: Math.max(FLOOR_Y + FLOOR_CLEAR, Math.min(420, p.y)),   // can't aim underground
+        y: Math.max(FLOOR_Y + FLOOR_CLEAR, Math.min(420, p.y)),
       });
 
-      // FK sliders stop at the floor: if the requested angle would clip,
-      // binary-search between the current (legal) angle and the request
-      // to find exactly where the arm touches down.
-      const setAngleSafe = (key, valRad) => {
-        setAngles((a) => {
+      // FK sliders stop at the floor via binary search to the touchdown angle.
+      const safeAngle = (setter) => (key, valRad) => {
+        setter((a) => {
+          if (key === "t0") return { ...a, t0: valRad };   // yaw can't hit the floor
           const cand = { ...a, [key]: valRad };
           if (poseValid(cand.t1, cand.t2)) return cand;
           let lo = a[key], hi = valRad;
@@ -494,8 +1036,27 @@
           return { ...a, [key]: lo };
         });
       };
+      const setAngleSafe = safeAngle(setAngles);
+      const setAngle3Safe = safeAngle(setAngles3);
 
-      /* ---- desktop: pointer lock ("steal" the mouse) ---- */
+      /* ---- 3D target drag (from Arm3D raycast) ---- */
+      const dragTarget3 = useCallback((wx, wz) => {
+        setMode("ik");
+        const lim = R_MAX + 60;
+        setTarget3((t) => ({
+          x: Math.max(-lim, Math.min(lim, wx)),
+          y: t.y,
+          z: Math.max(-lim, Math.min(lim, wz)),
+        }));
+      }, []);
+
+      /* ---- 3D target height (lift handle / Shift+drag / Shift+scroll) ---- */
+      const setHeight3 = useCallback((h) => {
+        setMode("ik");
+        setTarget3((t) => ({ ...t, y: Math.max(FLOOR_Y + FLOOR_CLEAR, Math.min(420, h)) }));
+      }, []);
+
+      /* ---- 2D desktop: pointer lock ("steal" the mouse) ---- */
       useEffect(() => {
         const onLockChange = () => setLocked(document.pointerLockElement === canvasRef.current);
         document.addEventListener("pointerlockchange", onLockChange);
@@ -506,9 +1067,21 @@
         if (!locked) return;
         const onMove = (e) => {
           setMode("ik");
-          setTarget((t) => clampTarget({ x: t.x + e.movementX / KSCALE, y: t.y - e.movementY / KSCALE }));
+          // hold Shift for 4x finer control near the target
+          const k = (e.shiftKey ? 0.25 : 1) / KSCALE;
+          setTarget((t) => clampTarget({ x: t.x + e.movementX * k, y: t.y - e.movementY * k }));
         };
-        const onKey = (e) => { if (e.key === "e" || e.key === "E") setElbowUp(v => !v); };
+        const onKey = (e) => {
+          if (e.key === "e" || e.key === "E") { setElbowUp(v => !v); return; }
+          // arrow keys nudge the target — precise vertical moves on demand
+          const step = e.shiftKey ? 0.5 : 3;
+          const nudge = { ArrowUp: [0, step], ArrowDown: [0, -step], ArrowLeft: [-step, 0], ArrowRight: [step, 0] }[e.key];
+          if (nudge) {
+            e.preventDefault();
+            setMode("ik");
+            setTarget((t) => clampTarget({ x: t.x + nudge[0], y: t.y + nudge[1] }));
+          }
+        };
         const onClick = () => document.exitPointerLock();
         document.addEventListener("mousemove", onMove);
         document.addEventListener("keydown", onKey);
@@ -520,18 +1093,28 @@
         };
       }, [locked]);
 
-      /* ---- phone: touch-drag the target directly ---- */
+      /* ---- 2D: scroll wheel raises / lowers the target ---- */
+      useEffect(() => {
+        if (view !== "2d" || !canvasRef.current) return;
+        const el = canvasRef.current;
+        const onWheel = (e) => {
+          e.preventDefault();
+          setMode("ik");
+          const step = e.shiftKey ? 0.04 : 0.15;   // Shift = fine height trim
+          setTarget((t) => clampTarget({ x: t.x, y: t.y - e.deltaY * step }));
+        };
+        el.addEventListener("wheel", onWheel, { passive: false });
+        return () => el.removeEventListener("wheel", onWheel);
+      }, [view]);
+
+      /* ---- 2D phone: touch-drag the target directly ---- */
       const onPointerDown = (e) => {
         if (e.pointerType === "mouse") {
-          // Desktop path: capture the mouse. Fallback to direct follow if
-          // the browser doesn't support pointer lock.
           if (!locked && canvasRef.current.requestPointerLock) {
             canvasRef.current.requestPointerLock();
             return;
           }
         }
-        // Touch / pen (or mouse fallback): jump the target to the finger
-        // and drag it from there. touch-action:none stops page scrolling.
         e.preventDefault();
         canvasRef.current.setPointerCapture(e.pointerId);
         setTouching(true);
@@ -545,8 +1128,9 @@
       };
       const onPointerUp = () => setTouching(false);
 
-      /* ---- drawing ---- */
+      /* ---- 2D drawing ---- */
       useEffect(() => {
+        if (view !== "2d" || !canvasRef.current) return;
         const ctx = canvasRef.current.getContext("2d");
         ctx.clearRect(0, 0, KW, KH);
 
@@ -567,8 +1151,7 @@
           ctx.setLineDash([]);
         });
 
-        // the floor — solid ground, hatched underneath, red when the arm
-        // is pressing against it
+        // the floor — solid ground, hatched underneath, red on contact
         const gy = KORIGIN.y + 46;
         ctx.strokeStyle = floorBlocked ? T.red : T.line;
         ctx.lineWidth = floorBlocked ? 2.5 : 1.5;
@@ -609,9 +1192,9 @@
           ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
         };
         link(KORIGIN, pE, 11, T.panelHi);
-        link(KORIGIN, pE, 7, reachable ? T.cyan : T.red);
+        link(KORIGIN, pE, 7, reachable && !floorBlocked ? T.cyan : T.red);
         link(pE, pG, 9, T.panelHi);
-        link(pE, pG, 5, reachable ? T.cyan : T.red);
+        link(pE, pG, 5, reachable && !floorBlocked ? T.cyan : T.red);
 
         const a12 = t1 + t2;
         const jaw = (side) => {
@@ -643,7 +1226,7 @@
 
         if (mode === "ik") {
           const pT = toCanvas(target.x, target.y);
-          ctx.strokeStyle = reachable ? T.green : T.red;
+          ctx.strokeStyle = reachable && !floorBlocked ? T.green : T.red;
           ctx.lineWidth = 1.5;
           ctx.beginPath(); ctx.arc(pT.x, pT.y, 9, 0, Math.PI * 2); ctx.stroke();
           ctx.beginPath();
@@ -658,76 +1241,126 @@
       });
 
       useEffect(() => {
+        if (view !== "2d") return;
         const tr = trail.current;
         const last = tr[tr.length - 1];
         if (!last || Math.hypot(last.x - grip.x, last.y - grip.y) > 2) {
           tr.push({ x: grip.x, y: grip.y });
           if (tr.length > 120) tr.shift();
         }
-      }, [grip.x, grip.y]);
+      }, [grip.x, grip.y, view]);
 
-      const dist = Math.hypot(target.x, target.y);
+      const dist = view === "2d" ? Math.hypot(target.x, target.y) : Math.hypot(rHoriz, target3.y);
       const active = locked || touching;
+      const ok = reachable && !floorBlocked;
 
       return (
         <div>
+          {/* view toggle */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+            <button style={view === "2d" ? styles.btn : styles.ghostBtn} onClick={() => setView("2d")}>2D — schematic</button>
+            <button style={view === "3d" ? styles.btn : styles.ghostBtn} onClick={() => setView("3d")}>3D — spatial + base rotation</button>
+          </div>
+
+          {/* viewport */}
           <div style={{ ...styles.panel, padding: 12, marginBottom: 18, position: "relative" }}>
-            <canvas
-              ref={canvasRef}
-              width={KW} height={KH}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerCancel={onPointerUp}
-              style={{ width: "100%", display: "block", borderRadius: 6, background: T.bg, cursor: locked ? "none" : "crosshair", touchAction: "none" }}
-            />
-            {!active && (
-              <div style={{ position: "absolute", top: 20, left: 20, right: 20, maxWidth: 340, pointerEvents: "none", background: `${T.panel}EE`, border: `1px solid ${T.line}`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: T.cyan }}>
-                  {isTouch ? "Touch and drag to drive the arm" : "Click the canvas to enter interactive mode"}
+            {view === "2d" ? (
+              <React.Fragment>
+                <canvas
+                  ref={canvasRef}
+                  width={KW} height={KH}
+                  onPointerDown={onPointerDown}
+                  onPointerMove={onPointerMove}
+                  onPointerUp={onPointerUp}
+                  onPointerCancel={onPointerUp}
+                  style={{ width: "100%", display: "block", borderRadius: 6, background: T.bg, cursor: locked ? "none" : "crosshair", touchAction: "none" }}
+                />
+                {!active && (
+                  <div style={{ position: "absolute", top: 20, left: 20, right: 20, maxWidth: 340, pointerEvents: "none", background: `${T.panel}EE`, border: `1px solid ${T.line}`, borderRadius: 8, padding: "10px 14px" }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: T.cyan }}>
+                      {isTouch ? "Touch and drag to drive the arm" : "Click the canvas to enter interactive mode"}
+                    </div>
+                    <div style={{ ...styles.mono, fontSize: 11.5, color: T.dim, marginTop: 4 }}>
+                      {isTouch
+                        ? "The gripper chases your finger via inverse kinematics."
+                        : "Mouse drives the gripper · scroll = raise / lower · Shift = fine control · arrow keys nudge · E flips the elbow · ESC or click releases"}
+                    </div>
+                  </div>
+                )}
+                {active && (
+                  <div style={{ position: "absolute", top: 20, right: 20, pointerEvents: "none", ...styles.mono, fontSize: 11, color: T.green, letterSpacing: "0.12em" }}>
+                    ● {locked ? "MOUSE CAPTURED" : "TRACKING"} — IK
+                  </div>
+                )}
+              </React.Fragment>
+            ) : (
+              <React.Fragment>
+                <Arm3D
+                  pose={{ t0, t1, t2, reachable, floorBlocked }}
+                  target={target3}
+                  onDragTarget={dragTarget3}
+                  onSetHeight={setHeight3}
+                />
+                <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 8 }}>
+                  Drag the <span style={{ color: T.green }}>ball</span> to move horizontally ·
+                  drag the <span style={{ color: T.amber }}>▲ handle</span>{isTouch ? "" : " (or Shift+drag the ball)"} to raise / lower ·
+                  drag empty space to orbit · {isTouch ? "pinch zooms" : "scroll zooms · Shift+scroll = height"} ·
+                  height slider in Controls
                 </div>
-                <div style={{ ...styles.mono, fontSize: 11.5, color: T.dim, marginTop: 4 }}>
-                  {isTouch
-                    ? "The gripper chases your finger via inverse kinematics."
-                    : "Your mouse is captured — move it to drive the gripper. E flips the elbow, ESC or click releases the mouse."}
-                </div>
-              </div>
-            )}
-            {active && (
-              <div style={{ position: "absolute", top: 20, right: 20, pointerEvents: "none", ...styles.mono, fontSize: 11, color: T.green, letterSpacing: "0.12em" }}>
-                ● {locked ? "MOUSE CAPTURED" : "TRACKING"} — IK
-              </div>
+              </React.Fragment>
             )}
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))", gap: 18 }}>
 
+            {/* controls */}
             <div style={styles.panel}>
               <Eyebrow>Controls</Eyebrow>
               <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
                 <button style={mode === "ik" ? styles.btn : styles.ghostBtn} onClick={() => setMode("ik")}>IK — chase target</button>
-                <button style={mode === "fk" ? styles.btn : styles.ghostBtn} onClick={() => { setMode("fk"); setAngles({ t1, t2 }); }}>FK — set angles</button>
+                <button style={mode === "fk" ? styles.btn : styles.ghostBtn}
+                  onClick={() => {
+                    setMode("fk");
+                    if (view === "2d") setAngles({ t1, t2 });
+                    else setAngles3({ t0, t1, t2 });
+                  }}>FK — set angles</button>
               </div>
 
               {mode === "fk" ? (
                 <div>
-                  <div style={{ ...styles.mono, fontSize: 11.5, color: T.green, marginBottom: 2 }}>θ1 shoulder — {deg(angles.t1).toFixed(1)}°</div>
-                  <input type="range" min={-30} max={200} step={0.5} value={deg(angles.t1)}
-                    onChange={(e) => setAngleSafe("t1", e.target.value * Math.PI / 180)}
+                  {view === "3d" && (
+                    <React.Fragment>
+                      <div style={{ ...styles.mono, fontSize: 11.5, color: T.cyan, marginBottom: 2 }}>θ0 base — {deg(angles3.t0).toFixed(1)}°</div>
+                      <input type="range" min={-180} max={180} step={0.5} value={deg(angles3.t0)}
+                        onChange={(e) => setAngle3Safe("t0", e.target.value * Math.PI / 180)}
+                        style={{ width: "100%", accentColor: T.cyan }} />
+                    </React.Fragment>
+                  )}
+                  <div style={{ ...styles.mono, fontSize: 11.5, color: T.green, margin: "10px 0 2px" }}>θ1 shoulder — {deg(view === "2d" ? angles.t1 : angles3.t1).toFixed(1)}°</div>
+                  <input type="range" min={-30} max={200} step={0.5} value={deg(view === "2d" ? angles.t1 : angles3.t1)}
+                    onChange={(e) => (view === "2d" ? setAngleSafe : setAngle3Safe)("t1", e.target.value * Math.PI / 180)}
                     style={{ width: "100%", accentColor: T.green }} />
-                  <div style={{ ...styles.mono, fontSize: 11.5, color: T.amber, margin: "10px 0 2px" }}>θ2 elbow — {deg(angles.t2).toFixed(1)}°</div>
-                  <input type="range" min={-160} max={160} step={0.5} value={deg(angles.t2)}
-                    onChange={(e) => setAngleSafe("t2", e.target.value * Math.PI / 180)}
+                  <div style={{ ...styles.mono, fontSize: 11.5, color: T.amber, margin: "10px 0 2px" }}>θ2 elbow — {deg(view === "2d" ? angles.t2 : angles3.t2).toFixed(1)}°</div>
+                  <input type="range" min={-160} max={160} step={0.5} value={deg(view === "2d" ? angles.t2 : angles3.t2)}
+                    onChange={(e) => (view === "2d" ? setAngleSafe : setAngle3Safe)("t2", e.target.value * Math.PI / 180)}
                     style={{ width: "100%", accentColor: T.amber }} />
                   <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 10 }}>
-                    Every angle pair lands the gripper somewhere — but the sliders
-                    stop where the arm would hit the floor.
+                    Every angle set lands the gripper somewhere — but the sliders
+                    stop where the arm would hit the floor.{view === "3d" ? " The base yaw can spin freely; only pitch angles can dig in." : ""}
                   </div>
                 </div>
               ) : (
                 <div>
+                  {view === "3d" && (
+                    <React.Fragment>
+                      <div style={{ ...styles.mono, fontSize: 11.5, color: T.green, marginBottom: 2 }}>Target height — {target3.y.toFixed(0)} mm</div>
+                      <input type="range" min={Math.ceil(FLOOR_Y + FLOOR_CLEAR)} max={340} step={1} value={target3.y}
+                        onChange={(e) => setTarget3(t => ({ ...t, y: Number(e.target.value) }))}
+                        style={{ width: "100%", accentColor: T.green, marginBottom: 10 }} />
+                    </React.Fragment>
+                  )}
                   <button style={{ ...styles.ghostBtn, width: "100%", marginBottom: 10 }} onClick={() => setElbowUp(v => !v)}>
-                    Elbow: {elbowUp ? "up" : "down"} — flip{isTouch ? "" : " (or press E)"}
+                    Elbow: {elbowUp ? "up" : "down"} — flip{isTouch || view === "3d" ? "" : " (or press E)"}
                   </button>
                   <div style={{ ...styles.mono, fontSize: 11, color: T.dim }}>
                     Most targets have two valid poses — mirror images of each other.
@@ -737,13 +1370,25 @@
               )}
             </div>
 
+            {/* live state */}
             <div style={styles.panel}>
               <Eyebrow color={T.green}>Live state</Eyebrow>
+              {view === "3d" && <Readout label="θ0 BASE" value={fmtN(deg(t0))} unit="deg" color={T.cyan} />}
               <Readout label="θ1 SHOULDER" value={fmtN(deg(t1))} unit="deg" color={T.green} />
               <Readout label="θ2 ELBOW" value={fmtN(deg(t2))} unit="deg" color={T.amber} />
-              <Readout label="GRIPPER X (FK)" value={fmtN(grip.x)} unit="mm" />
-              <Readout label="GRIPPER Y (FK)" value={fmtN(grip.y)} unit="mm" />
-              {mode === "ik" && <Readout label="TARGET DIST" value={fmtN(dist)} unit="mm" color={reachable ? T.ink : T.red} />}
+              {view === "2d" ? (
+                <React.Fragment>
+                  <Readout label="GRIPPER X (FK)" value={fmtN(grip.x)} unit="mm" />
+                  <Readout label="GRIPPER Y (FK)" value={fmtN(grip.y)} unit="mm" />
+                </React.Fragment>
+              ) : (
+                <React.Fragment>
+                  <Readout label="GRIPPER X (FK)" value={fmtN(grip3.x)} unit="mm" />
+                  <Readout label="GRIPPER Y (FK)" value={fmtN(grip3.y)} unit="mm" />
+                  <Readout label="GRIPPER Z (FK)" value={fmtN(grip3.z)} unit="mm" />
+                </React.Fragment>
+              )}
+              {mode === "ik" && <Readout label="TARGET DIST" value={fmtN(dist)} unit="mm" color={ok ? T.ink : T.red} />}
               <div style={{ ...styles.mono, fontSize: 11, marginTop: 10, color: floorBlocked ? T.red : !reachable ? T.red : autoFlipped ? T.amber : T.green }}>
                 {floorBlocked
                   ? "FLOOR CONTACT — both elbow poses would clip the ground, holding last legal pose"
@@ -755,22 +1400,32 @@
               </div>
             </div>
 
+            {/* the math, live */}
             <div style={styles.panel}>
               <Eyebrow color={T.amber}>The math, live</Eyebrow>
               <div style={{ ...styles.mono, fontSize: 11.5, lineHeight: 1.9, color: T.dim, overflowX: "auto" }}>
-                <div style={{ color: T.cyan, fontWeight: 600 }}>Forward — angles in, position out</div>
-                x = L1·cos(θ1) + L2·cos(θ1+θ2)<br/>
-                &nbsp;&nbsp;= <span style={{ color: T.ink }}>{grip.x.toFixed(1)} mm</span><br/>
-                y = L1·sin(θ1) + L2·sin(θ1+θ2)<br/>
-                &nbsp;&nbsp;= <span style={{ color: T.ink }}>{grip.y.toFixed(1)} mm</span>
+                {view === "3d" && (
+                  <React.Fragment>
+                    <div style={{ color: T.cyan, fontWeight: 600 }}>Step 0 — 3D collapses to 2D</div>
+                    θ0 = atan2(z, x) = <span style={{ color: T.cyan }}>{deg(t0).toFixed(1)}°</span><br/>
+                    r = √(x²+z²) = <span style={{ color: T.ink }}>{(mode === "ik" ? rHoriz : grip.x).toFixed(1)} mm</span><br/>
+                    <span style={{ fontSize: 10.5 }}>now solve the (r, height) plane exactly like 2D:</span>
+                  </React.Fragment>
+                )}
+                <div style={{ color: T.cyan, fontWeight: 600, marginTop: view === "3d" ? 6 : 0 }}>Forward — angles in, position out</div>
+                {view === "3d" ? "r" : "x"} = L1·cos(θ1) + L2·cos(θ1+θ2)
+                &nbsp;= <span style={{ color: T.ink }}>{grip.x.toFixed(1)} mm</span><br/>
+                {view === "3d" ? "h" : "y"} = L1·sin(θ1) + L2·sin(θ1+θ2)
+                &nbsp;= <span style={{ color: T.ink }}>{grip.y.toFixed(1)} mm</span>
                 <div style={{ color: T.cyan, fontWeight: 600, marginTop: 8 }}>Inverse — position in, angles out</div>
                 cos(θ2) = (d² − L1² − L2²)/(2·L1·L2)<br/>
                 θ2 = <span style={{ color: T.amber }}>{deg(t2).toFixed(1)}°</span> &nbsp;(law of cosines)<br/>
-                θ1 = atan2(y,x) − atan2(L2·sinθ2, L1+L2·cosθ2)<br/>
+                θ1 = atan2({view === "3d" ? "h, r" : "y, x"}) − atan2(L2·sinθ2, L1+L2·cosθ2)<br/>
                 θ1 = <span style={{ color: T.green }}>{deg(t1).toFixed(1)}°</span>
               </div>
             </div>
 
+            {/* measured hardware */}
             <div style={styles.panel}>
               <Eyebrow color={T.red}>Measured from the STLs</Eyebrow>
               <Readout label="L1 · ALT_KOL" value="199.4" unit="mm" />
@@ -780,7 +1435,7 @@
               <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 10 }}>
                 Pivot-to-pivot, not bounding boxes: shoulder bearing bore →
                 elbow gear axis (Alt_Kol), elbow hole → wrist bore (On_Kol).
-                These are the numbers the Arduino IK sketch uses.
+                The 3D base yaw is the Alt_Govde / Tabla_Alt turntable joint.
               </div>
             </div>
           </div>
@@ -804,7 +1459,13 @@
             if (!p.codeLearned) p.codeLearned = []; // Ensure old saves are backwards compatible
             setParts(p);
           }
-          if (Array.isArray(c)) setSnippets(c);
+          let code = Array.isArray(c) ? c : [];
+          if (!code.some(s => s.id === "arm3dof-v1")) {
+            // seed the 3-DOF sketch once; user edits/deletes persist after
+            code = [{ id: "arm3dof-v1", title: "3-DOF arm \u2014 base + shoulder + elbow IK (matches the 3D sim)", body: ARM_3DOF_SKETCH, ts: Date.now() }, ...code];
+            sSet(CODE_KEY, code);
+          }
+          setSnippets(code);
           if (Array.isArray(n)) setNotes(n);
           setLoaded(true);
         })();
