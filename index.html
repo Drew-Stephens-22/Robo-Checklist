@@ -345,6 +345,372 @@
       );
     }
 
+    /* ------------------------ page: kinematics ------------------------ */
+    /*  Interactive FK / IK demo. Link lengths measured pivot-to-pivot     */
+    /*  from the STLs: L1 = 199.4 mm (Alt_Kol), L2 = 140.0 mm (On_Kol).    */
+    /*  Desktop: click canvas -> pointer lock ("steals" the mouse).        */
+    /*  Phone:   touch and drag the canvas directly.                       */
+
+    const L1 = 199.4, L2 = 140.0;
+    const R_MAX = L1 + L2, R_MIN = Math.abs(L1 - L2);
+
+    function forwardKinematics(t1, t2) {
+      return {
+        x: L1 * Math.cos(t1) + L2 * Math.cos(t1 + t2),
+        y: L1 * Math.sin(t1) + L2 * Math.sin(t1 + t2),
+      };
+    }
+
+    function inverseKinematics(x, y, elbowUp) {
+      const d2 = x * x + y * y;
+      const d = Math.sqrt(d2);
+      if (d > R_MAX || d < R_MIN) return null;
+      let c2 = (d2 - L1 * L1 - L2 * L2) / (2 * L1 * L2);
+      c2 = Math.max(-1, Math.min(1, c2));
+      let t2 = Math.acos(c2);
+      if (!elbowUp) t2 = -t2;
+      const t1 = Math.atan2(y, x) - Math.atan2(L2 * Math.sin(t2), L1 + L2 * Math.cos(t2));
+      return { t1, t2 };
+    }
+
+    const deg = (r) => (r * 180 / Math.PI);
+    const fmtN = (n, p = 1) => (n >= 0 ? " " : "") + n.toFixed(p);
+
+    const KW = 820, KH = 480;
+    const KSCALE = 0.62;
+    const KORIGIN = { x: KW * 0.42, y: KH - 90 };
+    const toCanvas = (mx, my) => ({ x: KORIGIN.x + mx * KSCALE, y: KORIGIN.y - my * KSCALE });
+
+    function Readout({ label, value, unit, color = T.ink }) {
+      return (
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "5px 0", borderBottom: `1px dashed ${T.line}` }}>
+          <span style={{ ...styles.mono, fontSize: 11.5, color: T.dim, letterSpacing: "0.06em" }}>{label}</span>
+          <span style={{ ...styles.mono, fontSize: 14, fontWeight: 600, color }}>
+            {value}<span style={{ fontSize: 11, color: T.dim, marginLeft: 4 }}>{unit}</span>
+          </span>
+        </div>
+      );
+    }
+
+    function KinematicsPage() {
+      const canvasRef = useRef(null);
+      const [locked, setLocked] = useState(false);
+      const [touching, setTouching] = useState(false);
+      const [mode, setMode] = useState("ik");
+      const [elbowUp, setElbowUp] = useState(true);
+      const [target, setTarget] = useState({ x: 240, y: 140 });
+      const [angles, setAngles] = useState({ t1: 0.9, t2: -0.9 });
+      const trail = useRef([]);
+
+      // Coarse pointer = phone/tablet. Decides which control scheme we offer.
+      const isTouch = typeof window !== "undefined" &&
+        window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+
+      /* ---- resolve current pose ---- */
+      let t1, t2, reachable = true;
+      if (mode === "ik") {
+        const sol = inverseKinematics(target.x, target.y, elbowUp);
+        if (sol) { t1 = sol.t1; t2 = sol.t2; }
+        else {
+          reachable = false;
+          t1 = Math.atan2(target.y, target.x);
+          t2 = target.x * target.x + target.y * target.y < R_MIN * R_MIN ? (elbowUp ? 2.8 : -2.8) : 0;
+        }
+      } else {
+        t1 = angles.t1; t2 = angles.t2;
+      }
+      const elbow = { x: L1 * Math.cos(t1), y: L1 * Math.sin(t1) };
+      const grip = forwardKinematics(t1, t2);
+
+      /* ---- shared: canvas client coords -> arm world coords (mm) ---- */
+      const clientToWorld = (clientX, clientY) => {
+        const rect = canvasRef.current.getBoundingClientRect();
+        const cx = (clientX - rect.left) * (KW / rect.width);
+        const cy = (clientY - rect.top) * (KH / rect.height);
+        return { x: (cx - KORIGIN.x) / KSCALE, y: (KORIGIN.y - cy) / KSCALE };
+      };
+      const clampTarget = (p) => ({
+        x: Math.max(-260, Math.min(420, p.x)),
+        y: Math.max(-120, Math.min(420, p.y)),
+      });
+
+      /* ---- desktop: pointer lock ("steal" the mouse) ---- */
+      useEffect(() => {
+        const onLockChange = () => setLocked(document.pointerLockElement === canvasRef.current);
+        document.addEventListener("pointerlockchange", onLockChange);
+        return () => document.removeEventListener("pointerlockchange", onLockChange);
+      }, []);
+
+      useEffect(() => {
+        if (!locked) return;
+        const onMove = (e) => {
+          setMode("ik");
+          setTarget((t) => clampTarget({ x: t.x + e.movementX / KSCALE, y: t.y - e.movementY / KSCALE }));
+        };
+        const onKey = (e) => { if (e.key === "e" || e.key === "E") setElbowUp(v => !v); };
+        const onClick = () => document.exitPointerLock();
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("keydown", onKey);
+        document.addEventListener("mousedown", onClick);
+        return () => {
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("keydown", onKey);
+          document.removeEventListener("mousedown", onClick);
+        };
+      }, [locked]);
+
+      /* ---- phone: touch-drag the target directly ---- */
+      const onPointerDown = (e) => {
+        if (e.pointerType === "mouse") {
+          // Desktop path: capture the mouse. Fallback to direct follow if
+          // the browser doesn't support pointer lock.
+          if (!locked && canvasRef.current.requestPointerLock) {
+            canvasRef.current.requestPointerLock();
+            return;
+          }
+        }
+        // Touch / pen (or mouse fallback): jump the target to the finger
+        // and drag it from there. touch-action:none stops page scrolling.
+        e.preventDefault();
+        canvasRef.current.setPointerCapture(e.pointerId);
+        setTouching(true);
+        setMode("ik");
+        setTarget(clampTarget(clientToWorld(e.clientX, e.clientY)));
+      };
+      const onPointerMove = (e) => {
+        if (!touching) return;
+        e.preventDefault();
+        setTarget(clampTarget(clientToWorld(e.clientX, e.clientY)));
+      };
+      const onPointerUp = () => setTouching(false);
+
+      /* ---- drawing ---- */
+      useEffect(() => {
+        const ctx = canvasRef.current.getContext("2d");
+        ctx.clearRect(0, 0, KW, KH);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(KORIGIN.x, KORIGIN.y, R_MAX * KSCALE, 0, Math.PI * 2);
+        ctx.arc(KORIGIN.x, KORIGIN.y, R_MIN * KSCALE, 0, Math.PI * 2, true);
+        ctx.fillStyle = T.cyan + "0D";
+        ctx.fill();
+        ctx.restore();
+        [R_MIN, R_MAX].forEach((r) => {
+          ctx.beginPath();
+          ctx.setLineDash([5, 6]);
+          ctx.arc(KORIGIN.x, KORIGIN.y, r * KSCALE, 0, Math.PI * 2);
+          ctx.strokeStyle = T.line;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.setLineDash([]);
+        });
+
+        ctx.strokeStyle = T.line;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(20, KORIGIN.y + 46);
+        ctx.lineTo(KW - 20, KORIGIN.y + 46);
+        ctx.stroke();
+        ctx.fillStyle = T.panelHi;
+        ctx.strokeStyle = T.line;
+        ctx.beginPath();
+        ctx.roundRect(KORIGIN.x - 44, KORIGIN.y + 6, 88, 40, 6);
+        ctx.fill(); ctx.stroke();
+
+        const tr = trail.current;
+        for (let i = 1; i < tr.length; i++) {
+          const a = toCanvas(tr[i - 1].x, tr[i - 1].y);
+          const b = toCanvas(tr[i].x, tr[i].y);
+          ctx.strokeStyle = T.green + Math.round((i / tr.length) * 120).toString(16).padStart(2, "0");
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        }
+
+        const pE = toCanvas(elbow.x, elbow.y);
+        const pG = toCanvas(grip.x, grip.y);
+
+        const link = (a, b, w, color) => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = w;
+          ctx.lineCap = "round";
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        };
+        link(KORIGIN, pE, 11, T.panelHi);
+        link(KORIGIN, pE, 7, reachable ? T.cyan : T.red);
+        link(pE, pG, 9, T.panelHi);
+        link(pE, pG, 5, reachable ? T.cyan : T.red);
+
+        const a12 = t1 + t2;
+        const jaw = (side) => {
+          const perp = a12 + side * Math.PI / 2;
+          const bx = pG.x + Math.cos(perp) * 7;
+          const by = pG.y - Math.sin(perp) * 7;
+          ctx.beginPath();
+          ctx.moveTo(bx, by);
+          ctx.lineTo(bx + Math.cos(a12) * 16, by - Math.sin(a12) * 16);
+          ctx.strokeStyle = T.amber;
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        };
+        jaw(1); jaw(-1);
+
+        const joint = (p, r, color) => {
+          ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+          ctx.fillStyle = T.bg; ctx.fill();
+          ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
+        };
+        joint(KORIGIN, 8, T.cyan);
+        joint(pE, 6, T.cyan);
+        joint(pG, 4, T.amber);
+
+        ctx.strokeStyle = T.green; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(KORIGIN.x, KORIGIN.y, 26, 0, -t1, t1 > 0); ctx.stroke();
+        ctx.strokeStyle = T.amber;
+        ctx.beginPath(); ctx.arc(pE.x, pE.y, 20, -t1, -(t1 + t2), t2 > 0); ctx.stroke();
+
+        if (mode === "ik") {
+          const pT = toCanvas(target.x, target.y);
+          ctx.strokeStyle = reachable ? T.green : T.red;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.arc(pT.x, pT.y, 9, 0, Math.PI * 2); ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(pT.x - 14, pT.y); ctx.lineTo(pT.x + 14, pT.y);
+          ctx.moveTo(pT.x, pT.y - 14); ctx.lineTo(pT.x, pT.y + 14);
+          ctx.stroke();
+        }
+
+        ctx.fillStyle = T.dim;
+        ctx.font = "11px 'IBM Plex Mono', monospace";
+        ctx.fillText("(0,0) shoulder", KORIGIN.x - 100, KORIGIN.y + 4);
+      });
+
+      useEffect(() => {
+        const tr = trail.current;
+        const last = tr[tr.length - 1];
+        if (!last || Math.hypot(last.x - grip.x, last.y - grip.y) > 2) {
+          tr.push({ x: grip.x, y: grip.y });
+          if (tr.length > 120) tr.shift();
+        }
+      }, [grip.x, grip.y]);
+
+      const dist = Math.hypot(target.x, target.y);
+      const active = locked || touching;
+
+      return (
+        <div>
+          <div style={{ ...styles.panel, padding: 12, marginBottom: 18, position: "relative" }}>
+            <canvas
+              ref={canvasRef}
+              width={KW} height={KH}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={onPointerUp}
+              style={{ width: "100%", display: "block", borderRadius: 6, background: T.bg, cursor: locked ? "none" : "crosshair", touchAction: "none" }}
+            />
+            {!active && (
+              <div style={{ position: "absolute", top: 20, left: 20, right: 20, maxWidth: 340, pointerEvents: "none", background: `${T.panel}EE`, border: `1px solid ${T.line}`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: T.cyan }}>
+                  {isTouch ? "Touch and drag to drive the arm" : "Click the canvas to enter interactive mode"}
+                </div>
+                <div style={{ ...styles.mono, fontSize: 11.5, color: T.dim, marginTop: 4 }}>
+                  {isTouch
+                    ? "The gripper chases your finger via inverse kinematics."
+                    : "Your mouse is captured — move it to drive the gripper. E flips the elbow, ESC or click releases the mouse."}
+                </div>
+              </div>
+            )}
+            {active && (
+              <div style={{ position: "absolute", top: 20, right: 20, pointerEvents: "none", ...styles.mono, fontSize: 11, color: T.green, letterSpacing: "0.12em" }}>
+                ● {locked ? "MOUSE CAPTURED" : "TRACKING"} — IK
+              </div>
+            )}
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))", gap: 18 }}>
+
+            <div style={styles.panel}>
+              <Eyebrow>Controls</Eyebrow>
+              <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+                <button style={mode === "ik" ? styles.btn : styles.ghostBtn} onClick={() => setMode("ik")}>IK — chase target</button>
+                <button style={mode === "fk" ? styles.btn : styles.ghostBtn} onClick={() => { setMode("fk"); setAngles({ t1, t2 }); }}>FK — set angles</button>
+              </div>
+
+              {mode === "fk" ? (
+                <div>
+                  <div style={{ ...styles.mono, fontSize: 11.5, color: T.green, marginBottom: 2 }}>θ1 shoulder — {deg(angles.t1).toFixed(1)}°</div>
+                  <input type="range" min={-30} max={200} step={0.5} value={deg(angles.t1)}
+                    onChange={(e) => setAngles(a => ({ ...a, t1: e.target.value * Math.PI / 180 }))}
+                    style={{ width: "100%", accentColor: T.green }} />
+                  <div style={{ ...styles.mono, fontSize: 11.5, color: T.amber, margin: "10px 0 2px" }}>θ2 elbow — {deg(angles.t2).toFixed(1)}°</div>
+                  <input type="range" min={-160} max={160} step={0.5} value={deg(angles.t2)}
+                    onChange={(e) => setAngles(a => ({ ...a, t2: e.target.value * Math.PI / 180 }))}
+                    style={{ width: "100%", accentColor: T.amber }} />
+                  <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 10 }}>
+                    FK never fails — every pair of angles lands the gripper somewhere.
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <button style={{ ...styles.ghostBtn, width: "100%", marginBottom: 10 }} onClick={() => setElbowUp(v => !v)}>
+                    Elbow: {elbowUp ? "up" : "down"} — flip{isTouch ? "" : " (or press E)"}
+                  </button>
+                  <div style={{ ...styles.mono, fontSize: 11, color: T.dim }}>
+                    Most targets have two valid poses — mirror images of each other.
+                    Flip while tracking and watch the arm snap to the other solution.
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={styles.panel}>
+              <Eyebrow color={T.green}>Live state</Eyebrow>
+              <Readout label="θ1 SHOULDER" value={fmtN(deg(t1))} unit="deg" color={T.green} />
+              <Readout label="θ2 ELBOW" value={fmtN(deg(t2))} unit="deg" color={T.amber} />
+              <Readout label="GRIPPER X (FK)" value={fmtN(grip.x)} unit="mm" />
+              <Readout label="GRIPPER Y (FK)" value={fmtN(grip.y)} unit="mm" />
+              {mode === "ik" && <Readout label="TARGET DIST" value={fmtN(dist)} unit="mm" color={reachable ? T.ink : T.red} />}
+              <div style={{ ...styles.mono, fontSize: 11, marginTop: 10, color: reachable ? T.green : T.red }}>
+                {reachable
+                  ? "REACHABLE — IK solved, FK round-trip matches target"
+                  : `UNREACHABLE — need ${R_MIN.toFixed(0)} ≤ d ≤ ${R_MAX.toFixed(0)} mm`}
+              </div>
+            </div>
+
+            <div style={styles.panel}>
+              <Eyebrow color={T.amber}>The math, live</Eyebrow>
+              <div style={{ ...styles.mono, fontSize: 11.5, lineHeight: 1.9, color: T.dim, overflowX: "auto" }}>
+                <div style={{ color: T.cyan, fontWeight: 600 }}>Forward — angles in, position out</div>
+                x = L1·cos(θ1) + L2·cos(θ1+θ2)<br/>
+                &nbsp;&nbsp;= <span style={{ color: T.ink }}>{grip.x.toFixed(1)} mm</span><br/>
+                y = L1·sin(θ1) + L2·sin(θ1+θ2)<br/>
+                &nbsp;&nbsp;= <span style={{ color: T.ink }}>{grip.y.toFixed(1)} mm</span>
+                <div style={{ color: T.cyan, fontWeight: 600, marginTop: 8 }}>Inverse — position in, angles out</div>
+                cos(θ2) = (d² − L1² − L2²)/(2·L1·L2)<br/>
+                θ2 = <span style={{ color: T.amber }}>{deg(t2).toFixed(1)}°</span> &nbsp;(law of cosines)<br/>
+                θ1 = atan2(y,x) − atan2(L2·sinθ2, L1+L2·cosθ2)<br/>
+                θ1 = <span style={{ color: T.green }}>{deg(t1).toFixed(1)}°</span>
+              </div>
+            </div>
+
+            <div style={styles.panel}>
+              <Eyebrow color={T.red}>Measured from the STLs</Eyebrow>
+              <Readout label="L1 · ALT_KOL" value="199.4" unit="mm" />
+              <Readout label="L2 · ON_KOL" value="140.0" unit="mm" />
+              <Readout label="MAX REACH" value={R_MAX.toFixed(1)} unit="mm" />
+              <Readout label="MIN REACH" value={R_MIN.toFixed(1)} unit="mm" />
+              <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 10 }}>
+                Pivot-to-pivot, not bounding boxes: shoulder bearing bore →
+                elbow gear axis (Alt_Kol), elbow hole → wrist bore (On_Kol).
+                These are the numbers the Arduino IK sketch uses.
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     /* ------------------------------ app ------------------------------- */
 
     function RoboticArmTracker() {
@@ -379,7 +745,7 @@
               <Eyebrow>Project file</Eyebrow>
               <h1 style={{ margin: "0 0 16px", fontSize: "clamp(22px, 4.5vw, 32px)", color: "#fff" }}>Robotic Arm <span style={{ color: T.cyan }}>Build Tracker</span></h1>
               <nav style={{ display: "flex", gap: 4, overflowX: "auto" }}>
-                {[{ id: "parts", label: "Parts" }, { id: "video", label: "Video" }, { id: "code", label: "Code" }, { id: "notes", label: "Log" }].map(p => (
+                {[{ id: "parts", label: "Parts" }, { id: "kinematics", label: "Kinematics" }, { id: "video", label: "Video" }, { id: "code", label: "Code" }, { id: "notes", label: "Log" }].map(p => (
                   <button key={p.id} onClick={() => setPage(p.id)} style={{ background: page === p.id ? T.bg : "transparent", color: page === p.id ? T.cyan : T.dim, padding: "10px 16px", border: "none", cursor: "pointer", fontWeight: 600 }}>{p.label}</button>
                 ))}
               </nav>
@@ -387,6 +753,7 @@
           </header>
           <main style={{ maxWidth: 860, margin: "0 auto", padding: "22px 20px 0" }}>
             {loaded && page === "parts" && <PartsPage parts={parts} setParts={setParts} save={saveParts} />}
+            {loaded && page === "kinematics" && <KinematicsPage />}
             {loaded && page === "video" && <VideoPage />}
             {loaded && page === "code" && <CodePage snippets={snippets} setSnippets={setSnippets} save={saveCode} />}
             {loaded && page === "notes" && <NotesPage notes={notes} setNotes={setNotes} save={saveNotes} />}
