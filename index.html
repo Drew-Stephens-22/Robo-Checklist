@@ -14,7 +14,7 @@
   <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
   
   <style>
-    body { margin: 0; padding: 0; }
+    body { margin: 0; padding: 0; overflow-x: hidden; }
   </style>
 </head>
 <body>
@@ -281,11 +281,66 @@
     /* -------------------------- page: video --------------------------- */
 
     function VideoPage() {
+      const vid = "CHV36hu9z3E";
       return (
-        <div style={{ ...styles.panel, marginBottom: 18 }}>
-          <Eyebrow>Assembly video</Eyebrow>
-          <div style={{ position: "relative", paddingTop: "56.25%", borderRadius: 8, overflow: "hidden", border: `1px solid ${T.line}`, marginTop: 10 }}>
-            <iframe src="https://www.youtube.com/embed/CHV36hu9z3E" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: "none" }} allowFullScreen />
+        <div style={{
+          // full-bleed breakout: the site's <main> caps content at 860px,
+          // this escapes that so the video can reach toward the screen
+          // edges while a little margin still shows the page background
+          position: "relative",
+          left: "50%", right: "50%",
+          marginLeft: "-50vw", marginRight: "-50vw",
+          width: "100vw",
+          boxSizing: "border-box",
+          padding: "0 18px",
+          marginBottom: 18,
+        }}>
+          <div style={{ ...styles.panel }}>
+            <Eyebrow>Assembly video</Eyebrow>
+            <div
+              style={{
+                marginTop: 10,
+                width: "100%",
+                height: 560,
+                minWidth: 320,
+                minHeight: 220,
+                maxWidth: "100%",
+                maxHeight: "85vh",
+                resize: "both",
+                overflow: "hidden",
+                borderRadius: 10,
+                border: `1px solid ${T.line}`,
+                background: T.bg,
+                padding: 10,
+                boxSizing: "border-box",
+              }}
+            >
+              <div style={{ display: "flex", gap: 10, height: "100%", width: "100%" }}>
+                {/* the actual player — exactly half the box */}
+                <div style={{ flex: "1 1 50%", minWidth: 0, height: "100%", borderRadius: 8, overflow: "hidden", border: `1px solid ${T.line}` }}>
+                  <iframe
+                    src={"https://www.youtube.com/embed/" + vid}
+                    style={{ width: "100%", height: "100%", border: "none", display: "block" }}
+                    allowFullScreen
+                  />
+                </div>
+                {/* the video's thumbnail still — the other, equal half */}
+                <div style={{ flex: "1 1 50%", minWidth: 0, height: "100%", borderRadius: 8, overflow: "hidden", border: `1px solid ${T.line}`, position: "relative" }}>
+                  <img
+                    src={"https://img.youtube.com/vi/" + vid + "/maxresdefault.jpg"}
+                    onError={(e) => { e.target.onerror = null; e.target.src = "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"; }}
+                    alt="Video thumbnail"
+                    style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+                  />
+                  <div style={{ position: "absolute", bottom: 8, left: 8, ...styles.mono, fontSize: 10.5, color: "#fff", background: "#00000099", padding: "3px 8px", borderRadius: 5 }}>
+                    Thumbnail still
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 8 }}>
+              Drag the bottom-right corner — left/right widens it, up/down heightens it. Both panes stay equal size.
+            </div>
           </div>
         </div>
       );
@@ -599,6 +654,38 @@ void loop() {
 }
 `;
 
+    /* ---- servo-style motion profile, shared by both views ----
+       Real servos slew at a finite speed (an MG996R does roughly
+       0.17 s / 60 deg, about 350 deg/s unloaded — we use a loaded,
+       believable fraction of that). The drawn arm chases the IK goal
+       at these speeds instead of teleporting between solutions. */
+    const SLEW_PITCH = 2.4;   // rad/s shoulder + elbow  (~140 deg/s)
+    const SLEW_YAW   = 3.2;   // rad/s base turntable    (~185 deg/s)
+
+    function wrapPi(a) {
+      while (a > Math.PI) a -= 2 * Math.PI;
+      while (a < -Math.PI) a += 2 * Math.PI;
+      return a;
+    }
+
+    // One animation step from displayed pose d toward goal pose g.
+    // Never produces a floor-clipping intermediate: if the straight
+    // joint-space path would sweep a link through the ground, it moves
+    // the joints that CAN move and lifts the shoulder to clear the rest
+    // — the same dodge a motion planner would make.
+    function stepPose(d, g, dt) {
+      const lim = (x, m) => Math.max(-m, Math.min(m, x));
+      const n0 = d.t0 + lim(wrapPi(g.t0 - d.t0), SLEW_YAW * dt);
+      const n1 = d.t1 + lim(g.t1 - d.t1, SLEW_PITCH * dt);
+      const n2 = d.t2 + lim(g.t2 - d.t2, SLEW_PITCH * dt);
+      if (poseValid(n1, n2)) return { t0: n0, t1: n1, t2: n2 };
+      if (poseValid(n1, d.t2)) return { t0: n0, t1: n1, t2: d.t2 };
+      if (poseValid(d.t1, n2)) return { t0: n0, t1: d.t1, t2: n2 };
+      const liftT1 = d.t1 + SLEW_PITCH * dt;
+      if (poseValid(liftT1, d.t2)) return { t0: n0, t1: liftT1, t2: d.t2 };
+      return { t0: n0, t1: d.t1, t2: d.t2 };
+    }
+
     function Readout({ label, value, unit, color = T.ink }) {      return (
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "5px 0", borderBottom: `1px dashed ${T.line}` }}>
           <span style={{ ...styles.mono, fontSize: 11.5, color: T.dim, letterSpacing: "0.06em" }}>{label}</span>
@@ -617,7 +704,7 @@ void loop() {
 
     const C3 = { cyan: 0x5CC8FF, green: 0x63E6A8, amber: 0xFFB454, red: 0xFF7B7B, line: 0x23405F, hi: 0x18304C, dim: 0x7FA0C0, bg: 0x0C1826 };
 
-    function Arm3D({ pose, target, onDragTarget, onSetHeight }) {
+    function Arm3D({ pose, target, onDragTarget, onSetHeight, onMoveJoints, onElbow, onLock }) {
       const mountRef = useRef(null);
       const propsRef = useRef({ pose, target });
       propsRef.current = { pose, target };
@@ -625,6 +712,12 @@ void loop() {
       cbRef.current = onDragTarget;
       const cbHeightRef = useRef(onSetHeight);
       cbHeightRef.current = onSetHeight;
+      const cbJointsRef = useRef(onMoveJoints);
+      cbJointsRef.current = onMoveJoints;
+      const cbElbowRef = useRef(onElbow);
+      cbElbowRef.current = onElbow;
+      const cbLockRef = useRef(onLock);
+      cbLockRef.current = onLock;
 
       useEffect(() => {
         if (!window.THREE) return;
@@ -782,9 +875,14 @@ void loop() {
         const ray = new THREE.Raycaster();
         const ndc = new THREE.Vector2();
         const pointers = new Map();
-        let dragMode = null;        // "target" | "lift" | "orbit" | "pinch"
+        let dragMode = null;        // "target" | "lift" | "orbit" | "pinch" | "maybe"
         let prevPinch = 0;
         let liftOffset = 0;         // grab offset so the ball doesn't jump
+        let lockedNow = false;      // mouse pointer-lock (direct joint control)
+        let extendHeld = false;     // L mouse button: elbow reaches out
+        let closeHeld = false;      // R mouse button: elbow folds in
+        let pressDist = 0;          // distinguishes a click (lock) from a drag (orbit)
+        renderer.domElement.style.cursor = "crosshair";
 
         const setNDC = (e) => {
           const rect = renderer.domElement.getBoundingClientRect();
@@ -805,43 +903,69 @@ void loop() {
           return (wy - b * d0) / den;
         };
 
+        /* ---- MOUSE: pointer-lock direct joint control ----
+           Click the view -> the mouse is captured and drives the JOINTS:
+             mouse forward / back  -> shoulder (the main large arm)
+             mouse left / right    -> base turntable
+             hold LEFT click       -> elbow reaches further out
+             hold RIGHT click      -> elbow folds back in
+             ESC                   -> release the mouse
+           A drag (>4 px before release) orbits the camera instead. */
+        const onLockChange = () => {
+          lockedNow = document.pointerLockElement === renderer.domElement;
+          cbLockRef.current(lockedNow);
+          if (!lockedNow) { extendHeld = false; closeHeld = false; }
+        };
+        document.addEventListener("pointerlockchange", onLockChange);
+
+        const S_BASE = 0.0045, S_SHOULDER = 0.0035;   // rad per px of mouse travel
+        const onLockedMove = (e) => {
+          if (!lockedNow) return;
+          // signs chosen so, from the default camera, the arm follows the hand:
+          // push forward = arm rises, mouse right = tip sweeps right
+          cbJointsRef.current(-e.movementX * S_BASE, -e.movementY * S_SHOULDER);
+        };
+        document.addEventListener("mousemove", onLockedMove);
+        const onCtx = (e) => e.preventDefault();      // right-click is a control
+        renderer.domElement.addEventListener("contextmenu", onCtx);
+
         const onDown = (e) => {
+          if (e.pointerType === "mouse") {
+            if (lockedNow) {
+              if (e.button === 0) extendHeld = true;
+              if (e.button === 2) closeHeld = true;
+              return;
+            }
+            renderer.domElement.setPointerCapture(e.pointerId);
+            pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            pressDist = 0;
+            dragMode = "maybe";     // click -> lock, drag -> orbit
+            return;
+          }
+          // touch / pen keep the drag scheme: ball, lift handle, orbit, pinch
           renderer.domElement.setPointerCapture(e.pointerId);
           pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
           if (pointers.size === 2) { dragMode = "pinch"; prevPinch = 0; return; }
           setNDC(e);
           ray.setFromCamera(ndc, camera);
-          // pick whichever zone the ray actually hits FIRST — no overlap,
-          // no ambiguity. Shift+ball is the only extra way into lift mode.
           const hits = ray.intersectObjects([hitBall, hitHandle]);
-          if (hits.length === 0) {
-            dragMode = "orbit";
-          } else if (hits[0].object === hitHandle || e.shiftKey) {
+          if (hits.length === 0) dragMode = "orbit";
+          else if (hits[0].object === hitHandle) {
             dragMode = "lift";
             const h = heightAtRay();
             liftOffset = h === null ? 0 : propsRef.current.target.y - h;
-          } else {
-            dragMode = "target";
-          }
-          renderer.domElement.style.cursor = "grabbing";
-        };
-        const hover = (e) => {
-          // idle mouse: show what a grab here would do
-          setNDC(e);
-          ray.setFromCamera(ndc, camera);
-          const hits = ray.intersectObjects([hitBall, hitHandle]);
-          const over = hits.length ? hits[0].object : null;
-          handleMat.emissive.setHex(over === hitHandle ? 0x6b4a12 : 0x2a1c08);
-          targetBall.material.emissive.setHex(over === hitBall ? 0x2e7050 : 0x1a4030);
-          renderer.domElement.style.cursor =
-            over === hitHandle ? "ns-resize" : over === hitBall ? "grab" : "";
+          } else dragMode = "target";
         };
         const onMove = (e) => {
-          if (!dragMode && e.pointerType === "mouse") { hover(e); return; }
+          if (e.pointerType === "mouse" && lockedNow) return;  // handled above
           const prev = pointers.get(e.pointerId);
           if (!prev) return;
           const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
           pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+          if (dragMode === "maybe") {
+            pressDist += Math.hypot(dx, dy);
+            if (pressDist > 4) dragMode = "orbit"; else return;
+          }
           if (dragMode === "pinch" && pointers.size === 2) {
             const [a, b] = [...pointers.values()];
             const d = Math.hypot(a.x - b.x, a.y - b.y);
@@ -868,18 +992,29 @@ void loop() {
           }
         };
         const endDrag = (e) => {
+          if (e && e.pointerType === "mouse") {
+            if (lockedNow) {
+              if (e.button === 0) extendHeld = false;
+              if (e.button === 2) closeHeld = false;
+              return;
+            }
+            if (dragMode === "maybe") {
+              // a clean click: capture the mouse and hand over the joints
+              pointers.delete(e.pointerId);
+              dragMode = null;
+              pressDist = 0;
+              if (renderer.domElement.requestPointerLock) renderer.domElement.requestPointerLock();
+              return;
+            }
+          }
           if (e && e.pointerId !== undefined) pointers.delete(e.pointerId);
           if (pointers.size < 2 && dragMode === "pinch") dragMode = "orbit";
-          if (pointers.size === 0) {
-            dragMode = null;                      // ALWAYS fully release the mode
-            renderer.domElement.style.cursor = "";
-          }
+          if (pointers.size === 0) { dragMode = null; pressDist = 0; }
         };
         const onUp = endDrag;
         const onWheel = (e) => {
           e.preventDefault();
           if (e.shiftKey) {
-            // Shift+scroll trims the target height instead of zooming
             cbHeightRef.current(propsRef.current.target.y - e.deltaY * 0.2);
             return;
           }
@@ -903,7 +1038,14 @@ void loop() {
 
         /* render loop */
         let raf;
+        let prevT = performance.now();
         const tick = () => {
+          const nowT = performance.now();
+          const dtf = Math.min(0.05, (nowT - prevT) / 1000);
+          prevT = nowT;
+          if (lockedNow && extendHeld !== closeHeld) {
+            cbElbowRef.current(extendHeld ? 1 : -1, dtf);
+          }
           const { pose: p, target: t } = propsRef.current;
           baseGroup.rotation.y = -p.t0;
           link1Group.rotation.z = p.t1;
@@ -950,6 +1092,10 @@ void loop() {
           renderer.domElement.removeEventListener("pointerup", onUp);
           renderer.domElement.removeEventListener("pointercancel", onUp);
           renderer.domElement.removeEventListener("lostpointercapture", onUp);
+          renderer.domElement.removeEventListener("contextmenu", onCtx);
+          document.removeEventListener("pointerlockchange", onLockChange);
+          document.removeEventListener("mousemove", onLockedMove);
+          if (document.pointerLockElement === renderer.domElement && document.exitPointerLock) document.exitPointerLock();
           renderer.domElement.removeEventListener("wheel", onWheel);
           mount.removeChild(renderer.domElement);
           renderer.dispose();
@@ -970,6 +1116,7 @@ void loop() {
       const canvasRef = useRef(null);
       const [view, setView] = useState("2d");
       const [locked, setLocked] = useState(false);
+      const [locked3, setLocked3] = useState(false);
       const [touching, setTouching] = useState(false);
       const [mode, setMode] = useState("ik");
       const [elbowUp, setElbowUp] = useState(true);
@@ -984,27 +1131,59 @@ void loop() {
       const isTouch = typeof window !== "undefined" &&
         window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
 
-      /* ---- resolve current pose (floor-aware, shared solver) ---- */
-      let t0 = 0, t1, t2, reachable = true, floorBlocked = false, autoFlipped = false;
+      /* ---- solve the GOAL pose (floor-aware, shared solver) ---- */
+      let g0 = 0, g1, g2, reachable = true, floorBlocked = false, autoFlipped = false;
       let rHoriz = 0;
       if (view === "2d") {
         if (mode === "ik") {
           const r = resolvePlanar(target.x, target.y, elbowUp, lastValid);
-          ({ t1, t2, reachable, floorBlocked, autoFlipped } = r);
+          ({ t1: g1, t2: g2, reachable, floorBlocked, autoFlipped } = r);
         } else {
-          t1 = angles.t1; t2 = angles.t2;
+          g1 = angles.t1; g2 = angles.t2;
         }
       } else {
         if (mode === "ik") {
           // 3D -> 2D reduction: base yaw from atan2, then the same triangle
           rHoriz = Math.hypot(target3.x, target3.z);
-          t0 = Math.atan2(target3.z, target3.x);
+          g0 = Math.atan2(target3.z, target3.x);
           const r = resolvePlanar(rHoriz, target3.y, elbowUp, lastValid3);
-          ({ t1, t2, reachable, floorBlocked, autoFlipped } = r);
+          ({ t1: g1, t2: g2, reachable, floorBlocked, autoFlipped } = r);
         } else {
-          t0 = angles3.t0; t1 = angles3.t1; t2 = angles3.t2;
+          g0 = angles3.t0; g1 = angles3.t1; g2 = angles3.t2;
         }
       }
+
+      /* ---- servo-speed motion: the DRAWN arm slews toward the goal ----
+         A rAF loop rate-limits every joint, so flipping the elbow or
+         jumping the target sweeps the arm through real intermediate
+         poses — no more 90-to-minus-90 teleports. */
+      const [disp, setDisp] = useState({ t0: 0.5, t1: 0.9, t2: -0.9 });
+      const dispRef = useRef(disp);
+      const goalRef = useRef({ t0: g0, t1: g1, t2: g2 });
+      goalRef.current = { t0: g0, t1: g1, t2: g2 };
+
+      useEffect(() => {
+        let raf, last = performance.now();
+        const eps = 0.0009;   // rad — stop re-rendering once settled
+        const tick = (now) => {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          const d = dispRef.current, g = goalRef.current;
+          if (Math.abs(wrapPi(g.t0 - d.t0)) > eps ||
+              Math.abs(g.t1 - d.t1) > eps ||
+              Math.abs(g.t2 - d.t2) > eps) {
+            dispRef.current = stepPose(d, g, dt);
+            setDisp(dispRef.current);
+          }
+          raf = requestAnimationFrame(tick);
+        };
+        raf = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(raf);
+      }, []);
+
+      const t0 = disp.t0, t1 = disp.t1, t2 = disp.t2;
+      const moving = Math.abs(wrapPi(g0 - t0)) > 0.02 ||
+                     Math.abs(g1 - t1) > 0.02 || Math.abs(g2 - t2) > 0.02;
       const elbow = { x: L1 * Math.cos(t1), y: L1 * Math.sin(t1) };
       const grip = forwardKinematics(t1, t2);   // planar (r, height)
       const grip3 = { x: Math.cos(t0) * grip.x, y: grip.y, z: Math.sin(t0) * grip.x };
@@ -1054,6 +1233,56 @@ void loop() {
       const setHeight3 = useCallback((h) => {
         setMode("ik");
         setTarget3((t) => ({ ...t, y: Math.max(FLOOR_Y + FLOOR_CLEAR, Math.min(420, h)) }));
+      }, []);
+
+      /* ---- 3D direct joint control (mouse pointer lock) ----
+         Driving joints directly IS forward kinematics, so this rides the
+         existing FK pipeline: floor clamps + servo-speed slew for free. */
+      const moveJoints3 = useCallback((d0, d1) => {
+        setMode("fk");
+        setAngles3((a) => {
+          const t0n = wrapPi(a.t0 + d0);
+          let t1n = Math.max(-30 * Math.PI / 180, Math.min(200 * Math.PI / 180, a.t1 + d1));
+          if (!poseValid(t1n, a.t2)) {
+            let lo = a.t1, hi = t1n;
+            for (let i = 0; i < 20; i++) {
+              const mid = (lo + hi) / 2;
+              if (poseValid(mid, a.t2)) lo = mid; else hi = mid;
+            }
+            t1n = lo;                     // shoulder stops at the floor
+          }
+          return { ...a, t0: t0n, t1: t1n };
+        });
+      }, []);
+
+      const elbow3 = useCallback((dir, dt) => {   // +1 = L-click, -1 = R-click
+        setMode("fk");
+        setAngles3((a) => {
+          // directly signed: L-click sweeps theta2 positive, R-click negative.
+          // The elbow crosses straight (0) freely, so from neutral you can
+          // go BOTH ways — out/up with one button, in/down with the other.
+          let t2n = a.t2 + dir * 1.6 * dt;
+          t2n = Math.max(-160 * Math.PI / 180, Math.min(160 * Math.PI / 180, t2n));
+          if (!poseValid(a.t1, t2n)) {
+            let lo = a.t2, hi = t2n;
+            for (let i = 0; i < 20; i++) {
+              const mid = (lo + hi) / 2;
+              if (poseValid(a.t1, mid)) lo = mid; else hi = mid;
+            }
+            t2n = lo;                     // elbow stops at the floor
+          }
+          return { ...a, t2: t2n };
+        });
+      }, []);
+
+      const onLock3 = useCallback((isLocked) => {
+        setLocked3(isLocked);
+        if (isLocked) {
+          // seed the joint goals from the arm's CURRENT drawn pose so
+          // taking control never makes it jump
+          setMode("fk");
+          setAngles3({ t0: dispRef.current.t0, t1: dispRef.current.t1, t2: dispRef.current.t2 });
+        }
       }, []);
 
       /* ---- 2D desktop: pointer lock ("steal" the mouse) ---- */
@@ -1300,12 +1529,30 @@ void loop() {
                   target={target3}
                   onDragTarget={dragTarget3}
                   onSetHeight={setHeight3}
+                  onMoveJoints={moveJoints3}
+                  onElbow={elbow3}
+                  onLock={onLock3}
                 />
+                {!isTouch && !locked3 && (
+                  <div style={{ position: "absolute", top: 20, left: 20, right: 20, maxWidth: 360, pointerEvents: "none", background: `${T.panel}EE`, border: `1px solid ${T.line}`, borderRadius: 8, padding: "10px 14px" }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: T.cyan }}>Click the arm to take control</div>
+                    <div style={{ ...styles.mono, fontSize: 11.5, color: T.dim, marginTop: 4 }}>
+                      Mouse ↕ = main arm · mouse ↔ = base ·
+                      hold <span style={{ color: T.amber }}>L-click</span> elbow up-out / <span style={{ color: T.amber }}>R-click</span> elbow down-in ·
+                      <span style={{ color: T.amber }}> ESC</span> releases · drag = orbit camera
+                    </div>
+                  </div>
+                )}
+                {!isTouch && locked3 && (
+                  <div style={{ position: "absolute", top: 20, right: 20, pointerEvents: "none", ...styles.mono, fontSize: 11, color: T.green, letterSpacing: "0.12em", textAlign: "right" }}>
+                    ● DIRECT CONTROL — FK<br/>
+                    <span style={{ color: T.dim, letterSpacing: 0 }}>↕ shoulder · ↔ base · L/R click elbow · ESC exits</span>
+                  </div>
+                )}
                 <div style={{ ...styles.mono, fontSize: 11, color: T.dim, marginTop: 8 }}>
-                  Drag the <span style={{ color: T.green }}>ball</span> to move horizontally ·
-                  drag the <span style={{ color: T.amber }}>▲ handle</span>{isTouch ? "" : " (or Shift+drag the ball)"} to raise / lower ·
-                  drag empty space to orbit · {isTouch ? "pinch zooms" : "scroll zooms · Shift+scroll = height"} ·
-                  height slider in Controls
+                  {isTouch
+                    ? <React.Fragment>Drag the <span style={{ color: T.green }}>ball</span> to move horizontally · drag the <span style={{ color: T.amber }}>▲ handle</span> to raise / lower · drag empty space to orbit · pinch zooms · height slider in Controls</React.Fragment>
+                    : <React.Fragment>Click = capture the mouse and drive the joints directly (forward kinematics) · drag = orbit · scroll = zoom · touch devices keep the drag-the-target scheme</React.Fragment>}
                 </div>
               </React.Fragment>
             )}
@@ -1389,13 +1636,15 @@ void loop() {
                 </React.Fragment>
               )}
               {mode === "ik" && <Readout label="TARGET DIST" value={fmtN(dist)} unit="mm" color={ok ? T.ink : T.red} />}
-              <div style={{ ...styles.mono, fontSize: 11, marginTop: 10, color: floorBlocked ? T.red : !reachable ? T.red : autoFlipped ? T.amber : T.green }}>
+              <div style={{ ...styles.mono, fontSize: 11, marginTop: 10, color: floorBlocked ? T.red : !reachable ? T.red : autoFlipped ? T.amber : moving ? T.cyan : T.green }}>
                 {floorBlocked
                   ? "FLOOR CONTACT — both elbow poses would clip the ground, holding last legal pose"
                   : !reachable
                   ? `UNREACHABLE — need ${R_MIN.toFixed(0)} ≤ d ≤ ${R_MAX.toFixed(0)} mm`
                   : autoFlipped
                   ? "REACHABLE — elbow auto-flipped to keep the arm above the floor"
+                  : moving
+                  ? "SLEWING — joints moving at servo speed toward the solution"
                   : "REACHABLE — IK solved, FK round-trip matches target"}
               </div>
             </div>
